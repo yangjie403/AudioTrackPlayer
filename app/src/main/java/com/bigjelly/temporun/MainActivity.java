@@ -5,6 +5,9 @@ import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioTrack;
 import android.os.Bundle;
+import android.support.annotation.Nullable;
+import android.widget.Button;
+
 import java.io.InputStream;
 import java.net.URL;
 
@@ -16,61 +19,26 @@ import javazoom.jl.decoder.SampleBuffer;
 
 public class MainActivity extends Activity {
 
-    private Decoder mDecoder;
-    private AudioTrack mAudioTrack;
+    private Mp3AudioTrackPlayer player = new Mp3AudioTrackPlayer();
 
     @Override
-    protected void onCreate(Bundle savedInstanceState) {
+    protected void onCreate(@Nullable Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        final int sampleRate = 44100;
-        final int minBufferSize = AudioTrack.getMinBufferSize(sampleRate,
-                AudioFormat.CHANNEL_OUT_STEREO,
-                AudioFormat.ENCODING_PCM_16BIT);
-
-        mAudioTrack = new AudioTrack(AudioManager.STREAM_MUSIC,
-                sampleRate,
-                AudioFormat.CHANNEL_OUT_STEREO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                minBufferSize,
-                AudioTrack.MODE_STREAM);
-
-        mDecoder = new Decoder();
-        Thread thread = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    InputStream in = new URL("http://icecast.omroep.nl:80/radio1-sb-mp3")
-                            .openConnection()
-                            .getInputStream();
-                    Bitstream bitstream = new Bitstream(in);
-
-                    final int READ_THRESHOLD = 2147483647;
-                    int framesReaded = 0;
-
-                    Header header;
-                    for(; framesReaded++ <= READ_THRESHOLD && (header = bitstream.readFrame()) != null;) {
-                        SampleBuffer sampleBuffer = (SampleBuffer) mDecoder.decodeFrame(header, bitstream);
-                        short[] buffer = sampleBuffer.getBuffer();
-                        mAudioTrack.write(buffer, 0, buffer.length);
-                        bitstream.closeFrame();
-                    }
-
-                } catch (Exception e) {
-                    e.printStackTrace();
-                }
-            }
+        Button start = findViewById(R.id.start);
+        start.setOnClickListener(v -> {
+            player.playFromAssets(this, "music.mp3");
         });
-        thread.start();
-
-        mAudioTrack.play();
+        Button stop = findViewById(R.id.stop);
+        stop.setOnClickListener(v -> {
+            player.stop();
+        });
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
-
-        mAudioTrack.stop();
+        player.stop();
     }
 }
