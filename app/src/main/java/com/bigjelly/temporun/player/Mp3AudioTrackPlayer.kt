@@ -1,4 +1,4 @@
-package com.bigjelly.temporun
+package com.bigjelly.temporun.player
 
 import android.content.Context
 import android.content.res.AssetFileDescriptor

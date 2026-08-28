@@ -1,20 +1,11 @@
 package com.bigjelly.temporun;
 
 import android.app.Activity;
-import android.media.AudioFormat;
-import android.media.AudioManager;
-import android.media.AudioTrack;
 import android.os.Bundle;
 import android.support.annotation.Nullable;
 import android.widget.Button;
 
-import java.io.InputStream;
-import java.net.URL;
-
-import javazoom.jl.decoder.Bitstream;
-import javazoom.jl.decoder.Decoder;
-import javazoom.jl.decoder.Header;
-import javazoom.jl.decoder.SampleBuffer;
+import com.bigjelly.temporun.player.Mp3AudioTrackPlayer;
 
 
 public class MainActivity extends Activity {
