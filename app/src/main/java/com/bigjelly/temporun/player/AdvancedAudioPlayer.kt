@@ -265,6 +265,19 @@ class AdvancedAudioPlayer {
                     2 -> AudioFormat.CHANNEL_OUT_STEREO
                     else -> error("Unsupported channel count: $channelCount")
                 }
+
+                // AudioTrack 的输入格式在创建后不能随着 Codec 输出格式任意改变。
+                // 因此把首次音频轨道格式作为固定目标格式，后续 Codec 输出发生变化时，
+                // 先交给 PcmAudioConverter 转换，再写入同一个 AudioTrack。
+                val outputPcmFormat = PcmFormat(
+                    sampleRate = sampleRate,
+                    channelCount = channelCount,
+                    encoding = AudioFormat.ENCODING_PCM_16BIT
+                )
+                val pcmConverter = PcmAudioConverter(outputPcmFormat).apply {
+                    updateInputFormat(outputPcmFormat)
+                }
+
                 val minBufferSize = AudioTrack.getMinBufferSize(
                     sampleRate,
                     channelConfig,
@@ -312,7 +325,7 @@ class AdvancedAudioPlayer {
                 }
 
                 // 第四步：循环执行“送入压缩帧 -> 取出 PCM -> 写入 AudioTrack”。
-                decodeLoop(session, extractor, decoder, sampleRate, channelCount)
+                decodeLoop(session, extractor, decoder, sampleRate, channelCount, pcmConverter)
             } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
                 Log.d(TAG, "Playback interrupted")
@@ -336,7 +349,8 @@ class AdvancedAudioPlayer {
         extractor: MediaExtractor,
         decoder: MediaCodec,
         sampleRate: Int,
-        channelCount: Int
+        channelCount: Int,
+        pcmConverter: PcmAudioConverter
     ) {
         // MediaCodec 是流水线：输入端和输出端不是一一同步对应的，
         // 所以即使没有新的输出，也必须继续轮询，直到收到输出 EOS。
@@ -456,28 +470,45 @@ class AdvancedAudioPlayer {
 
             val outputIndex = decoder.dequeueOutputBuffer(bufferInfo, timeoutUs)
             if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                // 解码器可能在启动后才确定最终 PCM 格式。当前实现记录该事件；
-                // 必须校验它是否仍然与 AudioTrack 的配置一致，否则可能出现变速、杂音
-                // 或无声。当前播放器只支持 16-bit、单声道/双声道 PCM。
-                validateOutputFormat(decoder.outputFormat, sampleRate, channelCount)
+                // 解码器可能在启动后才确定最终 PCM 格式，也可能在播放过程中改变格式。
+                // AudioTrack 仍保持首次创建时的目标格式，转换器只更新输入端格式。
+                pcmConverter.updateInputFormat(
+                    readPcmFormat(decoder.outputFormat, sampleRate, channelCount)
+                )
                 continue
             }
             if (outputIndex < 0) continue
 
             val outputFlags = bufferInfo.flags
             val outputSize = bufferInfo.size
-            decoder.getOutputBuffer(outputIndex)?.let { outputBuffer ->
+            val outputEndOfStream =
+                outputFlags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+            val convertedBuffer = decoder.getOutputBuffer(outputIndex)?.let { outputBuffer ->
                 if (outputSize > 0) {
-                    // 输出阶段：Codec 给出 PCM，AudioTrack.write() 把 PCM 放入系统缓冲区。
-                    // writeFully() 会处理非阻塞写入导致的部分写入和暂时不可写。
+                    // 输出阶段：Codec 给出原始 PCM，先转换为 AudioTrack 的目标格式。
                     outputBuffer.position(bufferInfo.offset)
                     outputBuffer.limit(bufferInfo.offset + outputSize)
-                    writeFully(session, outputBuffer, outputSize)
+                    pcmConverter.convert(outputBuffer, outputSize, outputEndOfStream)
+                } else if (outputEndOfStream) {
+                    // EOS 缓冲区可能没有数据，但转换器内部仍可能保留最后一个插值采样点。
+                    pcmConverter.convert(null, 0, endOfStream = true)
+                } else {
+                    null
+                }
+            } ?: if (outputEndOfStream) {
+                pcmConverter.convert(null, 0, endOfStream = true)
+            } else {
+                null
+            }
+            convertedBuffer?.let { buffer ->
+                if (buffer.hasRemaining()) {
+                    // writeFully() 会处理非阻塞写入导致的部分写入和暂时不可写。
+                    writeFully(session, buffer, buffer.remaining())
                 }
             }
             decoder.releaseOutputBuffer(outputIndex, false)
 
-            if (outputSize > 0) {
+            if (convertedBuffer != null && convertedBuffer.position() > 0) {
                 // 这里使用 AudioTrack 的实际播放头计算进度，而不是解码时间戳。
                 val currentMs = calculatePlaybackPosition(
                     session, playbackStartFrame, positionBaseMs, sampleRate
@@ -488,7 +519,7 @@ class AdvancedAudioPlayer {
                 }
             }
 
-            if (outputFlags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+            if (outputEndOfStream) {
                 if (session.looping && !session.stopRequested) {
                     // 只有收到输出 EOS，上一轮数据才算完整 drain；此时再 seek 并 flush。
                     // 不 flush AudioTrack，避免丢掉已经写入但尚未播放的尾部 PCM。
@@ -507,42 +538,35 @@ class AdvancedAudioPlayer {
         }
     }
 
-    private fun validateOutputFormat(
+    private fun readPcmFormat(
         outputFormat: MediaFormat,
-        expectedSampleRate: Int,
-        expectedChannelCount: Int
-    ) {
+        fallbackSampleRate: Int,
+        fallbackChannelCount: Int
+    ): PcmFormat {
         // MediaCodec 的输出格式可能在 start() 后通过 INFO_OUTPUT_FORMAT_CHANGED 才确定。
-        // AudioTrack 已经按照输入格式创建，因此这里至少要确认解码器输出没有变化。
+        // 读取不到某个字段时沿用 Extractor 给出的初始格式。
         val outputSampleRate = if (outputFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
             outputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
         } else {
-            expectedSampleRate
+            fallbackSampleRate
         }
         val outputChannelCount = if (outputFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
             outputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
         } else {
-            expectedChannelCount
+            fallbackChannelCount
         }
 
         // KEY_PCM_ENCODING 在较新的 Android 版本中可能存在；使用字符串避免在旧版本
-        // 设备上直接访问不存在的 SDK 字段。没有该字段时，按当前播放器的 PCM 16-bit
-        // 配置处理。
+        // 设备上直接访问不存在的 SDK 字段。没有该字段时，按常见的 PCM 16-bit 处理。
         val outputEncoding = if (outputFormat.containsKey("pcm-encoding")) {
             outputFormat.getInteger("pcm-encoding")
         } else {
             AudioFormat.ENCODING_PCM_16BIT
         }
 
-        check(outputSampleRate == expectedSampleRate) {
-            "Decoder sample rate changed: $outputSampleRate != $expectedSampleRate"
-        }
-        check(outputChannelCount == expectedChannelCount) {
-            "Decoder channel count changed: $outputChannelCount != $expectedChannelCount"
-        }
-        check(outputEncoding == AudioFormat.ENCODING_PCM_16BIT) {
-            "Unsupported decoder PCM encoding: $outputEncoding"
-        }
+        // 这里不再要求输出格式与 AudioTrack 相同；PcmAudioConverter 会负责采样率和
+        // 声道转换。仅将格式交给转换器，由它统一校验是否支持该 PCM 编码。
+        return PcmFormat(outputSampleRate, outputChannelCount, outputEncoding)
     }
 
     private fun writeFully(session: PlaybackSession, buffer: ByteBuffer, size: Int) {
