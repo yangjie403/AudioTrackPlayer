@@ -1,6 +1,9 @@
 package com.bigjelly.temporun.player
 
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioFormat
@@ -30,6 +33,17 @@ import kotlin.math.abs
  */
 class AdvancedAudioPlayer {
 
+    /** 播放器对外暴露的生命周期状态。 */
+    enum class State {
+        IDLE,
+        PREPARING,
+        PLAYING,
+        PAUSED,
+        COMPLETED,
+        STOPPED,
+        ERROR
+    }
+
     companion object {
         private const val TAG = "AdvancedAudioPlayer"
         private const val PROGRESS_INTERVAL_MS = 100L
@@ -57,6 +71,16 @@ class AdvancedAudioPlayer {
     /** 非循环播放完成后回调。停止播放不会触发此回调。 */
     var onCompletionListener: (() -> Unit)? = null
 
+    /** 播放过程中发生异常时回调；正常 stop 不会触发此回调。 */
+    var onErrorListener: ((error: Throwable) -> Unit)? = null
+
+    /** 状态发生变化时回调，回调在主线程执行。 */
+    var onStateChangedListener: ((state: State) -> Unit)? = null
+
+    @Volatile
+    var state: State = State.IDLE
+        private set
+
     @Volatile
     var durationMs: Long = 0L
         private set
@@ -66,10 +90,13 @@ class AdvancedAudioPlayer {
         // 以下状态可能由 UI/音频焦点线程和播放线程共同访问，因此需要可见性保证。
         @Volatile
         var stopRequested = false
+
         @Volatile
         var paused = false
+
         @Volatile
         var looping = false
+
         @Volatile
         var pausedByFocus = false
 
@@ -80,9 +107,12 @@ class AdvancedAudioPlayer {
         // 下面的资源只属于当前会话，由当前会话的线程创建和释放。
         var thread: Thread? = null
         var audioTrack: AudioTrack? = null
+        var context: Context? = null
         var audioManager: AudioManager? = null
         var audioFocusRequest: AudioFocusRequest? = null
         var focusListener: AudioManager.OnAudioFocusChangeListener? = null
+        var noisyReceiver: BroadcastReceiver? = null
+        var noisyReceiverRegistered = false
     }
 
     fun playFromAssets(context: Context, assetName: String, loop: Boolean = false) {
@@ -97,6 +127,14 @@ class AdvancedAudioPlayer {
     fun playFromFilePath(path: String, loop: Boolean = false) {
         // 文件路径不需要额外关闭文件描述符；MediaExtractor 会管理数据源。
         startInternal(null, loop) { extractor -> extractor.setDataSource(path) }
+    }
+
+    /**
+     * 带 Context 的文件路径播放版本，可以申请音频焦点并监听耳机拔出事件。
+     * 保留上面的旧方法是为了兼容原有调用方。
+     */
+    fun playFromFilePath(context: Context, path: String, loop: Boolean = false) {
+        startInternal(context, loop) { extractor -> extractor.setDataSource(path) }
     }
 
     fun seekTo(positionMs: Long) {
@@ -115,9 +153,10 @@ class AdvancedAudioPlayer {
     fun pause() {
         val session = currentSession ?: return
         if (!session.stopRequested) {
-            // 设置标志后，播放线程会在 pauseLock 上等待，避免继续解码和写入。
+            // 这里只改变控制状态，不直接操作 AudioTrack。
+            // 播放线程会在自己的循环中暂停 AudioTrack，避免跨线程调用底层对象。
             session.paused = true
-            session.audioTrack?.pause()
+            synchronized(pauseLock) { pauseLock.notifyAll() }
         }
     }
 
@@ -127,7 +166,6 @@ class AdvancedAudioPlayer {
             // 先恢复状态，再唤醒播放线程；线程被唤醒后会重新检查状态。
             session.paused = false
             session.pausedByFocus = false
-            session.audioTrack?.play()
             synchronized(pauseLock) { pauseLock.notifyAll() }
         }
     }
@@ -148,7 +186,10 @@ class AdvancedAudioPlayer {
 
         // 这些回调只由本播放器的 Handler 管理，可以全部移除。
         mainHandler.removeCallbacksAndMessages(null)
-        if (session == null) return
+        if (session == null) {
+            updateState(null, State.STOPPED)
+            return
+        }
 
         // 唤醒暂停中的线程，并中断可能正在等待的阻塞操作。
         session.stopRequested = true
@@ -165,6 +206,7 @@ class AdvancedAudioPlayer {
                 Log.w(TAG, "Interrupted while waiting for playback thread", e)
             }
         }
+        updateState(session, State.STOPPED)
     }
 
     private fun startInternal(
@@ -181,6 +223,7 @@ class AdvancedAudioPlayer {
                 durationMs = 0L
             }
         }
+        updateState(session, State.PREPARING)
 
         session.thread = Thread {
             Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
@@ -261,15 +304,24 @@ class AdvancedAudioPlayer {
                 decoder = MediaCodec.createDecoderByType(mime)
                 decoder.configure(audioFormat, null, null, 0)
                 decoder.start()
-                if (!session.paused) session.audioTrack?.play()
+                if (!session.paused) {
+                    session.audioTrack?.play()
+                    updateState(session, State.PLAYING)
+                } else {
+                    updateState(session, State.PAUSED)
+                }
 
                 // 第四步：循环执行“送入压缩帧 -> 取出 PCM -> 写入 AudioTrack”。
-                decodeLoop(session, extractor, decoder, sampleRate)
+                decodeLoop(session, extractor, decoder, sampleRate, channelCount)
             } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
                 Log.d(TAG, "Playback interrupted")
             } catch (e: Exception) {
-                if (!session.stopRequested) Log.e(TAG, "Playback exception", e)
+                if (!session.stopRequested) {
+                    Log.e(TAG, "Playback exception", e)
+                    updateState(session, State.ERROR)
+                    postError(session, e)
+                }
             } finally {
                 releaseSession(session, decoder, extractor, focusAcquired)
             }
@@ -283,7 +335,8 @@ class AdvancedAudioPlayer {
         session: PlaybackSession,
         extractor: MediaExtractor,
         decoder: MediaCodec,
-        sampleRate: Int
+        sampleRate: Int,
+        channelCount: Int
     ) {
         // MediaCodec 是流水线：输入端和输出端不是一一同步对应的，
         // 所以即使没有新的输出，也必须继续轮询，直到收到输出 EOS。
@@ -300,6 +353,8 @@ class AdvancedAudioPlayer {
         var lastProgressMs = -PROGRESS_INTERVAL_MS
         var playbackStartFrame = playbackHeadFrames(session.audioTrack)
         var positionBaseMs = 0L
+        // 只在 AudioTrack 状态真正发生变化时调用 play()/pause()，避免每轮循环重复调用。
+        var audioTrackIsPlaying = !session.paused
 
         while (!session.stopRequested) {
             // seek 请求只记录目标位置，实际操作由本播放线程完成，保证顺序安全。
@@ -319,7 +374,10 @@ class AdvancedAudioPlayer {
 
                 // 先暂停 AudioTrack，再清空它内部尚未播放的 PCM 缓冲区，防止 seek 后
                 // 先听到跳转前残留的声音。AudioTrack 的 flush 不会影响 MediaExtractor。
-                session.audioTrack?.pause()
+                if (audioTrackIsPlaying) {
+                    session.audioTrack?.pause()
+                    audioTrackIsPlaying = false
+                }
                 session.audioTrack?.flush()
 
                 // seek/flush 后重新记录播放头基准。后续计算进度时，当前播放头减去这个
@@ -339,19 +397,36 @@ class AdvancedAudioPlayer {
 
                 // 如果用户不是处于暂停状态，seek 完成后恢复 AudioTrack。
                 // 如果当前是暂停状态，则保持暂停，等待 resume() 再播放。
-                if (!session.paused) session.audioTrack?.play()
+                if (!session.paused) {
+                    session.audioTrack?.play()
+                    audioTrackIsPlaying = true
+                }
             }
 
             synchronized(pauseLock) {
                 // 暂停时不再向 Codec 取数据，也不再向 AudioTrack 写数据。
+                // pause()/resume() 只修改状态，AudioTrack 的 pause()/play() 在这里由播放线程执行。
+                if (session.paused && audioTrackIsPlaying) {
+                    session.audioTrack?.pause()
+                    audioTrackIsPlaying = false
+                    updateState(session, State.PAUSED)
+                }
                 while (session.paused && !session.stopRequested && session.pendingSeekUs < 0L) {
                     pauseLock.wait()
                 }
             }
             if (session.stopRequested) break
-            if (session.pendingSeekUs >= 0L) {
-                continue
+
+            // seekTo() 可能是在 wait() 期间发起的。被唤醒后要回到循环顶部，
+            // 先执行 seek + flush，不能先把 seek 前的数据继续送入 AudioTrack。
+            if (session.pendingSeekUs >= 0L) continue
+
+            if (!session.paused && !audioTrackIsPlaying) {
+                session.audioTrack?.play()
+                audioTrackIsPlaying = true
+                updateState(session, State.PLAYING)
             }
+            if (session.pendingSeekUs >= 0L) continue
 
             if (!inputEosSent) {
                 // 输入阶段：从媒体文件读取一帧压缩数据，送入 Codec 输入缓冲区。
@@ -382,8 +457,9 @@ class AdvancedAudioPlayer {
             val outputIndex = decoder.dequeueOutputBuffer(bufferInfo, timeoutUs)
             if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 // 解码器可能在启动后才确定最终 PCM 格式。当前实现记录该事件；
-                // 生产环境还应根据 outputFormat 校验采样率、声道数和 PCM 编码。
-                Log.d(TAG, "Decoder output format: ${decoder.outputFormat}")
+                // 必须校验它是否仍然与 AudioTrack 的配置一致，否则可能出现变速、杂音
+                // 或无声。当前播放器只支持 16-bit、单声道/双声道 PCM。
+                validateOutputFormat(decoder.outputFormat, sampleRate, channelCount)
                 continue
             }
             if (outputIndex < 0) continue
@@ -422,11 +498,50 @@ class AdvancedAudioPlayer {
                     lastProgressMs = -PROGRESS_INTERVAL_MS
                 } else {
                     // 非循环播放：所有 PCM 输出完成后通知进度和播放完成。
+                    updateState(session, State.COMPLETED)
                     postProgress(session, durationMs)
                     postCompletion(session)
                     break
                 }
             }
+        }
+    }
+
+    private fun validateOutputFormat(
+        outputFormat: MediaFormat,
+        expectedSampleRate: Int,
+        expectedChannelCount: Int
+    ) {
+        // MediaCodec 的输出格式可能在 start() 后通过 INFO_OUTPUT_FORMAT_CHANGED 才确定。
+        // AudioTrack 已经按照输入格式创建，因此这里至少要确认解码器输出没有变化。
+        val outputSampleRate = if (outputFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+            outputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+        } else {
+            expectedSampleRate
+        }
+        val outputChannelCount = if (outputFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+            outputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+        } else {
+            expectedChannelCount
+        }
+
+        // KEY_PCM_ENCODING 在较新的 Android 版本中可能存在；使用字符串避免在旧版本
+        // 设备上直接访问不存在的 SDK 字段。没有该字段时，按当前播放器的 PCM 16-bit
+        // 配置处理。
+        val outputEncoding = if (outputFormat.containsKey("pcm-encoding")) {
+            outputFormat.getInteger("pcm-encoding")
+        } else {
+            AudioFormat.ENCODING_PCM_16BIT
+        }
+
+        check(outputSampleRate == expectedSampleRate) {
+            "Decoder sample rate changed: $outputSampleRate != $expectedSampleRate"
+        }
+        check(outputChannelCount == expectedChannelCount) {
+            "Decoder channel count changed: $outputChannelCount != $expectedChannelCount"
+        }
+        check(outputEncoding == AudioFormat.ENCODING_PCM_16BIT) {
+            "Unsupported decoder PCM encoding: $outputEncoding"
         }
     }
 
@@ -516,6 +631,29 @@ class AdvancedAudioPlayer {
         }
     }
 
+    private fun postError(session: PlaybackSession, error: Throwable) {
+        // 错误回调同样带有会话校验，旧播放失败时不能通知新播放界面。
+        mainHandler.post {
+            if (generation.get() == session.id) {
+                onErrorListener?.invoke(error)
+            }
+        }
+    }
+
+    private fun updateState(session: PlaybackSession?, newState: State) {
+        // 普通状态变化必须属于当前会话；STOPPED 例外，因为 stop() 会先摘除会话，
+        // 然后再通知外部停止完成。
+        if (session != null && newState != State.STOPPED && generation.get() != session.id) {
+            return
+        }
+        state = newState
+        mainHandler.post {
+            if (session == null || newState == State.STOPPED || generation.get() == session.id) {
+                onStateChangedListener?.invoke(newState)
+            }
+        }
+    }
+
     private fun requestAudioFocus(context: Context, session: PlaybackSession): Boolean {
         // 音频焦点可以理解为“当前哪个应用拥有播放音频的优先权”。
         // 例如，音乐播放时来电话或其他应用开始播放语音，系统会通知本播放器失去焦点。
@@ -548,7 +686,6 @@ class AdvancedAudioPlayer {
                     // 在 AUDIOFOCUS_GAIN 中再恢复原音量。
                     session.pausedByFocus = true
                     session.paused = true
-                    session.audioTrack?.pause()
 
                     // 如果播放线程正在 pauseLock.wait()，唤醒它重新检查状态。
                     synchronized(pauseLock) { pauseLock.notifyAll() }
@@ -560,7 +697,6 @@ class AdvancedAudioPlayer {
                     if (session.pausedByFocus && !session.stopRequested) {
                         session.pausedByFocus = false
                         session.paused = false
-                        session.audioTrack?.play()
 
                         // 唤醒播放线程，让它继续向 MediaCodec 和 AudioTrack 提供数据。
                         synchronized(pauseLock) { pauseLock.notifyAll() }
@@ -570,37 +706,74 @@ class AdvancedAudioPlayer {
         }
 
         // 保存 AudioManager 和监听器，释放会话时还要用同一个监听器/请求来放弃焦点。
+        session.context = context.applicationContext
         session.audioManager = manager
         session.focusListener = listener
 
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-            // API 26+：使用 AudioFocusRequest 描述本次焦点申请。
-            // AUDIOFOCUS_GAIN 表示这是长期媒体播放，而不是一声短提示音。
-            val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                .setAudioAttributes(
-                    AudioAttributes.Builder()
-                        // USAGE_MEDIA 告诉系统这是音乐/媒体播放，系统会据此进行音频策略管理。
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        // CONTENT_TYPE_MUSIC 表示内容类型是音乐，而不是语音或提示音。
-                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                        .build()
-                )
-                // 将上面的监听器交给系统，焦点变化时系统会调用它。
-                .setOnAudioFocusChangeListener(listener)
-                .build()
-            session.audioFocusRequest = request
+        val focusGranted =
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                // API 26+：使用 AudioFocusRequest 描述本次焦点申请。
+                // AUDIOFOCUS_GAIN 表示这是长期媒体播放，而不是一声短提示音。
+                val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            // USAGE_MEDIA 告诉系统这是音乐/媒体播放，系统会据此进行音频策略管理。
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            // CONTENT_TYPE_MUSIC 表示内容类型是音乐，而不是语音或提示音。
+                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                            .build()
+                    )
+                    // 将上面的监听器交给系统，焦点变化时系统会调用它。
+                    .setOnAudioFocusChangeListener(listener)
+                    .build()
+                session.audioFocusRequest = request
 
-            // 返回 AUDIOFOCUS_REQUEST_GRANTED 才表示申请成功，可以继续播放。
-            // 申请失败时抛出异常，外层 finally 仍会释放已经创建的资源。
-            return manager.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+                // 返回 AUDIOFOCUS_REQUEST_GRANTED 才表示申请成功，可以继续播放。
+                // 申请失败时抛出异常，外层 finally 仍会释放已经创建的资源。
+                manager.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+            } else {
+                // API 25 及以下的旧接口：需要传入监听器、音频流类型和焦点类型。
+                // 这里使用 STREAM_MUSIC，与 AudioTrack 的媒体音乐用途保持一致。
+                @Suppress("DEPRECATION")
+                manager.requestAudioFocus(
+                    listener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN
+                ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+            }
+
+        if (focusGranted) registerNoisyReceiver(session)
+        return focusGranted
+    }
+
+    private fun registerNoisyReceiver(session: PlaybackSession) {
+        // 耳机拔出或蓝牙音频设备断开时，系统发送此广播。
+        // 播放器自动暂停，避免声音突然从手机扬声器外放；重新连接后不自动恢复，
+        // 由用户主动调用 resume()。
+        val context = session.context ?: return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                if (intent.action == AudioManager.ACTION_AUDIO_BECOMING_NOISY &&
+                    !session.stopRequested
+                ) {
+                    session.paused = true
+                    synchronized(pauseLock) { pauseLock.notifyAll() }
+                }
+            }
         }
-
-        // API 25 及以下的旧接口：需要传入监听器、音频流类型和焦点类型。
-        // 这里使用 STREAM_MUSIC，与 AudioTrack 的媒体音乐用途保持一致。
-        @Suppress("DEPRECATION")
-        return manager.requestAudioFocus(
-            listener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN
-        ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        session.noisyReceiver = receiver
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            context.registerReceiver(
+                receiver,
+                IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY),
+                Context.RECEIVER_NOT_EXPORTED
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            context.registerReceiver(
+                receiver,
+                IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY)
+            )
+        }
+        session.noisyReceiverRegistered = true
     }
 
     private fun releaseSession(
@@ -641,6 +814,17 @@ class AdvancedAudioPlayer {
             extractor.release()
         } catch (e: Exception) {
             Log.w(TAG, "MediaExtractor.release failed", e)
+        }
+
+        // 动态注册的耳机拔出广播必须在会话结束时注销，否则会造成 Context 泄漏，
+        // 并且旧会话仍可能收到广播。
+        if (session.noisyReceiverRegistered) {
+            try {
+                session.context?.unregisterReceiver(session.noisyReceiver)
+            } catch (e: Exception) {
+                Log.w(TAG, "Unregister noisy receiver failed", e)
+            }
+            session.noisyReceiverRegistered = false
         }
 
         if (focusAcquired) {
