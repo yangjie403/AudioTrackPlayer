@@ -160,9 +160,30 @@ class Mp3AudioTrackPlayer {
             // 状态异常的对象；生产代码应检查异常和 audioTrack.state。
             .build()
 
-        // 初始化 MediaCodec 解码器
+        // 初始化 MediaCodec 解码器。
+        // MediaCodec 采用“输入缓冲区 -> 解码 -> 输出缓冲区”的异步队列式思路：
+        // 应用把 MP3 压缩数据放入输入缓冲区，解码器处理后，再从输出缓冲区取出 PCM。
+        //
+        // createDecoderByType() 根据 MIME 类型查找并创建“解码器”，例如：
+        // - audio/mpeg       -> MP3 解码器；
+        // - audio/mp4a-latm  -> AAC 解码器。
+        // 这里只创建解码器，还没有开始处理数据。
         val decoder = MediaCodec.createDecoderByType(mime)
+
+        // configure() 配置解码器，但此时解码器还没有进入运行状态。
+        // 第一个参数 audioFormat 是 MediaExtractor 从媒体文件中读取到的格式，
+        // 其中包含 MIME 类型、采样率、声道数等解码所需信息。
+        //
+        // 第二个参数是输出 Surface。音频解码不需要 Surface，所以传 null；
+        // 视频解码到屏幕时才通常会传入 Surface。
+        // 第三个参数是 MediaCrypto，用于受保护/加密媒体；普通 MP3 传 null。
+        // 第四个参数是配置标志。0 表示按“解码模式”配置；编码器才会使用
+        // MediaCodec.CONFIGURE_FLAG_ENCODE。
         decoder.configure(audioFormat, null, null, 0)
+
+        // start() 让解码器从“已配置”状态进入“执行”状态。
+        // 只有 start() 成功后，才能调用 dequeueInputBuffer()、getInputBuffer()、
+        // queueInputBuffer() 和 dequeueOutputBuffer() 等缓冲区 API。
         decoder.start()
 
         // play() 将 AudioTrack 从初始化状态切换到播放状态。
@@ -176,30 +197,85 @@ class Mp3AudioTrackPlayer {
         try {
             // 循环：提取数据 -> 送入解码器 -> 解码为 PCM -> 喂给 AudioTrack
             while (isPlaying) {
-                // 向 MediaCodec 输入压缩数据
+                // 向 MediaCodec 输入一块 MP3 压缩数据。
+                //
+                // isEOS（End Of Stream，流结束）只表示“已经没有新的压缩数据可以
+                // 从 MediaExtractor 读取”，并不表示解码器已经把之前收到的数据全部
+                // 解码完成。因此发送 EOS 后仍然要继续读取输出缓冲区，直到输出端也
+                // 返回 BUFFER_FLAG_END_OF_STREAM。
                 if (!isEOS) {
+                    // dequeueInputBuffer() 从 MediaCodec 的输入队列中申请一个可写的
+                    // 输入缓冲区，并返回它的索引。
+                    //
+                    // timeoutUs 的单位是微秒（这里是 10,000 微秒，即 10 毫秒）：
+                    // - 返回值 >= 0：成功取得输入缓冲区，返回值就是缓冲区索引；
+                    // - 返回 INFO_TRY_AGAIN_LATER（通常为 -1）：在超时时间内没有
+                    //   可用缓冲区，本轮跳过输入，稍后继续尝试。
                     val inputBufferIndex = decoder.dequeueInputBuffer(timeoutUs)
                     if (inputBufferIndex >= 0) {
+                        // getInputBuffer() 根据索引取得实际的 ByteBuffer，应用需要把
+                        // 一块压缩数据写入这个缓冲区。取得后，该缓冲区暂时归应用使用；
+                        // 调用 queueInputBuffer() 后，所有权会交还给 MediaCodec，不能再
+                        // 继续修改或读取它，直到解码器再次把它提供出来。
                         val inputBuffer = decoder.getInputBuffer(inputBufferIndex)
                         if (inputBuffer != null) {
+                            // readSampleData() 把 MediaExtractor 当前指向的压缩音频样本
+                            // 写入 inputBuffer，从第 0 个字节开始写。
+                            // 返回值是实际读取的字节数；返回负数表示已经没有更多样本。
                             val sampleSize = extractor.readSampleData(inputBuffer, 0)
                             if (sampleSize < 0) {
-                                // 数据读取完毕，解码器已到达末尾 EOS
+                                // 输入数据已经读取完毕，但 MediaCodec 可能还在处理之前
+                                // 送入的 MP3 数据，所以要用一个“大小为 0 的特殊输入缓冲区”
+                                // 通知它输入流结束。
+                                //
+                                // queueInputBuffer() 的参数依次是：
+                                // 1. inputBufferIndex：要提交的输入缓冲区索引；
+                                // 2. offset：有效数据起始偏移；EOS 没有数据，因此为 0；
+                                // 3. size：有效数据大小；EOS 缓冲区大小为 0；
+                                // 4. presentationTimeUs：时间戳，单位是微秒；EOS 时这里为 0；
+                                // 5. flags：标记该缓冲区是 BUFFER_FLAG_END_OF_STREAM。
                                 decoder.queueInputBuffer(inputBufferIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                                 isEOS = true
                             } else {
+                                // 把当前 MP3 样本提交给解码器。
+                                // sampleTime 是当前样本的播放时间戳，单位为微秒，传给
+                                // MediaCodec 后会成为对应输出 PCM 的时间信息。
+                                // flags=0 表示这是一块普通输入数据，没有特殊标记。
+                                // 提交后 inputBuffer 的所有权归 MediaCodec。
                                 decoder.queueInputBuffer(inputBufferIndex, 0, sampleSize, extractor.sampleTime, 0)
+
+                                // 只有当前样本已经成功提交给解码器后，才能让 Extractor
+                                // 移动到下一个样本。否则可能重复读取同一块 MP3 数据。
                                 extractor.advance()
                             }
                         }
                     }
                 }
 
-                // 从 MediaCodec 获取解码后的 PCM 数据
+                // 从 MediaCodec 获取解码后的 PCM 数据。
+                // 输入端 queueInputBuffer() 和输出端 dequeueOutputBuffer() 是相互
+                // 配合的：输入压缩数据后，解码器需要一定时间处理，因此不一定每次
+                // 循环都能立即得到输出。
+                //
+                // BufferInfo 会由 dequeueOutputBuffer() 填充，用于描述当前输出缓冲区
+                // 中有效数据的位置、长度、时间戳以及是否带有 EOS 标记。
                 val outputBufferIndex = decoder.dequeueOutputBuffer(bufferInfo, timeoutUs)
                 if (outputBufferIndex >= 0) {
+                    // dequeueOutputBuffer() 返回输出缓冲区索引时，说明有一块解码结果
+                    // 可以读取。返回值的常见含义是：
+                    // - >= 0：输出缓冲区索引，可以调用 getOutputBuffer()；
+                    // - INFO_TRY_AGAIN_LATER（通常为 -1）：暂时没有输出，稍后重试；
+                    // - INFO_OUTPUT_FORMAT_CHANGED（通常为 -2）：输出格式发生变化，
+                    //   应从 decoder.outputFormat 获取新的 MediaFormat；
+                    // - INFO_OUTPUT_BUFFERS_CHANGED（旧 API，通常为 -3）：输出缓冲区
+                    //   引用发生变化，旧版代码需要重新获取缓冲区列表；当前代码使用
+                    //   getOutputBuffer()，一般不需要单独处理这个状态。
                     val outputBuffer = decoder.getOutputBuffer(outputBufferIndex)
                     if (outputBuffer != null && bufferInfo.size > 0) {
+                        // getOutputBuffer() 根据索引取得解码器输出的 ByteBuffer。
+                        // 对 MP3 解码器来说，这里的有效内容通常是 PCM 音频数据，而不是
+                        // 原始 MP3 数据。只有 bufferInfo.offset 到 offset + size 范围内
+                        // 的数据有效。
                         outputBuffer.position(bufferInfo.offset)
                         outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
                         // 将 MediaCodec 输出的 PCM 写入 AudioTrack。
@@ -229,7 +305,9 @@ class Mp3AudioTrackPlayer {
                     // PCM 数据，必须由应用手动 write() 到 AudioTrack。
                     decoder.releaseOutputBuffer(outputBufferIndex, false)
 
-                    // 如果全部解码并播放完毕，退出循环
+                    // 只有当“输出端”也带有 EOS 标记时，才说明解码器已经把最后一块
+                    // 输入数据处理完毕。此时才能退出循环；仅仅 isEOS=true 还不够，
+                    // 因为解码器内部可能仍有排队中的数据。
                     if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
                         Log.d(TAG, "Playback completed")
                         break
@@ -247,7 +325,11 @@ class Mp3AudioTrackPlayer {
                 // release() 释放 AudioTrack 持有的系统音频资源。释放后该实例不能再使用，
                 // 必须重新通过 Builder 创建新的 AudioTrack。
                 audioTrack.release()
+                // stop() 让 MediaCodec 停止执行，并清空/结束当前的解码过程。
+                // 调用 stop() 后不能继续向它提交或读取数据；如果要再次使用，通常需要
+                // 重新 configure()，然后再次 start()。
                 decoder.stop()
+                // release() 释放 MediaCodec 占用的编解码器资源。释放后 decoder 不可再用。
                 decoder.release()
             } catch (e: Exception) {
                 Log.e(TAG, "Error while releasing resources", e)
