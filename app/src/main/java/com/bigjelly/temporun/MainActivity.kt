@@ -71,8 +71,9 @@ class MainActivity : Activity() {
             }
 
             override fun onStopTrackingTouch(seekBar: SeekBar) {
-                isUserTrackingSeekBar = false
                 advancedPlayer.seekTo(seekBar.progress.toLong())
+                // 先提交 seek，再允许播放进度回调更新控件，避免旧回调覆盖目标位置。
+                isUserTrackingSeekBar = false
             }
         })
 

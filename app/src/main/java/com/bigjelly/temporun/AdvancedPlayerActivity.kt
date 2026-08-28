@@ -104,8 +104,9 @@ private fun AdvancedPlayerScreen(modifier: Modifier = Modifier) {
                             currentMs = sliderMs
                         },
                         onValueChangeFinished = {
-                            isDragging = false
                             player.seekTo(sliderMs)
+                            // 先提交 seek，再结束拖动状态，避免旧进度回调在此期间覆盖目标位置。
+                            isDragging = false
                         },
                         valueRange = 0f..totalMs.coerceAtLeast(1L).toFloat(),
                         modifier = Modifier.fillMaxWidth()

@@ -104,6 +104,9 @@ class AdvancedAudioPlayer {
         @Volatile
         var pendingSeekUs = -1L
 
+        // 每次 seek 都递增。已经排队但属于 seek 之前位置的进度回调会被丢弃。
+        val positionGeneration = AtomicLong(0L)
+
         // 下面的资源只属于当前会话，由当前会话的线程创建和释放。
         var thread: Thread? = null
         var audioTrack: AudioTrack? = null
@@ -141,8 +144,14 @@ class AdvancedAudioPlayer {
         // 不直接操作 MediaExtractor/MediaCodec；所有解码器操作都交给播放线程。
         val session = currentSession ?: return
         val safePositionMs = positionMs.coerceAtLeast(0L).coerceAtMost(Long.MAX_VALUE / 1000L)
-        session.pendingSeekUs = safePositionMs * 1000L
-        synchronized(pauseLock) { pauseLock.notifyAll() }
+        synchronized(pauseLock) {
+            // pendingSeekUs 和 positionGeneration 必须在同一把锁内更新。
+            // 这样 postProgress() 不会在“已经有 seek 请求、但版本号还没更新”的窗口
+            // 内错误地投递旧位置回调。
+            session.pendingSeekUs = safePositionMs * 1000L
+            session.positionGeneration.incrementAndGet()
+            pauseLock.notifyAll()
+        }
     }
 
     fun setLooping(loop: Boolean) {
@@ -639,8 +648,17 @@ class AdvancedAudioPlayer {
     private fun postProgress(session: PlaybackSession, currentMs: Long) {
         // 只允许当前会话更新 UI。stop() 或新播放会递增 generation，旧回调会被丢弃。
         val total = durationMs
+        val positionGeneration = synchronized(pauseLock) {
+            // seek 请求已经产生但尚未处理时，不再投递旧播放位置。
+            if (session.pendingSeekUs >= 0L) return
+            session.positionGeneration.get()
+        }
         mainHandler.post {
-            if (generation.get() == session.id) {
+            // seek 之后 positionGeneration 会改变，已经排队的旧回调在这里失效。
+            if (generation.get() == session.id &&
+                session.positionGeneration.get() == positionGeneration &&
+                session.pendingSeekUs < 0L
+            ) {
                 onProgressListener?.invoke(currentMs.coerceAtLeast(0L), total)
             }
         }
@@ -648,8 +666,11 @@ class AdvancedAudioPlayer {
 
     private fun postCompletion(session: PlaybackSession) {
         // completion 也必须做会话校验，避免旧音频完成时清空新音频的 UI 状态。
+        val positionGeneration = session.positionGeneration.get()
         mainHandler.post {
-            if (generation.get() == session.id) {
+            if (generation.get() == session.id &&
+                session.positionGeneration.get() == positionGeneration
+            ) {
                 onCompletionListener?.invoke()
             }
         }
