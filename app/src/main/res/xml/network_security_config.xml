@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- 允许应用访问任意域名的明文 HTTP 地址。生产环境建议改用 HTTPS。 -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
