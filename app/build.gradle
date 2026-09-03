@@ -7,6 +7,15 @@ android {
 
     buildFeatures {
         compose true
+        prefab true
+    }
+
+    ndkVersion "28.2.13676358"
+
+    externalNativeBuild {
+        cmake {
+            path file("src/main/cpp/CMakeLists.txt")
+        }
     }
 
     defaultConfig {
@@ -15,6 +24,13 @@ android {
         targetSdk 36
         versionCode 1
         versionName "1.0"
+
+        externalNativeBuild {
+            cmake {
+                cppFlags "-std=c++17"
+                arguments "-DANDROID_STL=c++_shared"
+            }
+        }
     }
     buildTypes {
         release {
@@ -33,5 +49,6 @@ dependencies {
     implementation 'androidx.compose.ui:ui'
     implementation 'androidx.compose.ui:ui-tooling-preview'
     implementation 'androidx.compose.material3:material3'
+    implementation 'com.google.oboe:oboe:1.9.3'
     debugImplementation 'androidx.compose.ui:ui-tooling'
 }
