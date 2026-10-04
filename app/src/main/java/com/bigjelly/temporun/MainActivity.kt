@@ -7,6 +7,7 @@ import android.widget.CheckBox
 import android.widget.SeekBar
 import android.widget.TextView
 import com.bigjelly.temporun.player.AdvancedAudioPlayer
+import com.bigjelly.temporun.player.HttpAudioStreamPlayer
 import com.bigjelly.temporun.player.Mp3AudioTrackPlayer
 import java.util.Locale
 
@@ -14,6 +15,7 @@ class MainActivity : Activity() {
 
     private val player = Mp3AudioTrackPlayer()
     private val advancedPlayer = AdvancedAudioPlayer()
+    private val httpAudioStreamPlayer = HttpAudioStreamPlayer()
     private var isUserTrackingSeekBar = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -22,12 +24,14 @@ class MainActivity : Activity() {
 
         val start = findViewById<Button>(R.id.start)
         start.setOnClickListener {
-            player.playFromAssets(this, "music.mp3")
+            // player.playFromAssets(this, "music.mp3")
+            httpAudioStreamPlayer.start("http://like.mjieg.top/audio.mp3")
         }
 
         val stop = findViewById<Button>(R.id.stop)
         stop.setOnClickListener {
-            player.stop()
+            // player.stop()
+            httpAudioStreamPlayer.stop()
         }
 
         val seekBar = findViewById<SeekBar>(R.id.seek_bar)
@@ -95,6 +99,7 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         super.onDestroy()
         player.stop()
+        httpAudioStreamPlayer.stop()
         advancedPlayer.stop()
     }
 
