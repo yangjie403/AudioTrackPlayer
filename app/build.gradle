@@ -25,6 +25,13 @@ android {
         versionCode 1
         versionName "1.0"
 
+        // The copied FFmpeg static archives in app/src/main/cpp/ffmpeg/static
+        // currently provide these three ABIs.
+        // x86 is intentionally excluded because no x86 archive is present.
+        ndk {
+            abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86_64'
+        }
+
         externalNativeBuild {
             cmake {
                 cppFlags "-std=c++17"
