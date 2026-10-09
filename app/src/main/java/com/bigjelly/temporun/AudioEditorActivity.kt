@@ -71,17 +71,21 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
- * FFmpeg-backed audio editor entry screen.
+ * 音频编辑入口 Activity。
  *
- * SAF is used for both input and output, so the screen does not need broad storage
- * permissions. Temporary files only live in the app cache directory.
+ * 本类负责把 Android 文件选择器得到的 Uri 转成 native 层可以读取的普通文件路径，
+ * 再把耗时的 probe、波形提取、滤镜处理和导出任务放到单线程执行器中。真正的音频
+ * 解码、滤镜和编码实现位于 FfmpegBridge 及其对应的 ffmpeg_jni.cpp。
  */
 class AudioEditorActivity : ComponentActivity() {
 
+    /** 标记下一次选择的音频应该替换主音轨还是第二段拼接音轨。 */
     private enum class ImportTarget { FIRST, SECOND }
 
+    /** 标记待导出的 native 操作类型。 */
     private enum class ExportKind { TRIM, CONCAT }
 
+    /** 页面状态中保存的一段音频；file 是 native 层实际读取的缓存文件。 */
     data class Track(
         val file: File,
         val name: String,
@@ -89,6 +93,7 @@ class AudioEditorActivity : ComponentActivity() {
         val waveform: List<Float>,
     )
 
+    /** SAF 返回保存位置之前暂存的导出请求。 */
     private data class ExportRequest(
         val kind: ExportKind,
         val first: File,
@@ -98,6 +103,7 @@ class AudioEditorActivity : ComponentActivity() {
         val outputName: String,
     )
 
+    // native 音频处理是同步 JNI 调用，必须放到后台线程，避免阻塞主线程。
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
     private val player = AdvancedAudioPlayer()
     private var importTarget = ImportTarget.FIRST
@@ -110,12 +116,14 @@ class AudioEditorActivity : ComponentActivity() {
     private val statusState = mutableStateOf("正在加载示例音频…")
     private val busyState = mutableStateOf(true)
 
+    // OpenDocument 返回的是 content:// Uri，回调中会复制到 cacheDir 后再交给 FFmpeg。
     private val openAudio = registerForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) loadSelectedAudio(uri, importTarget)
     }
 
+    // CreateDocument 只负责让用户选择最终保存位置，native 先写缓存文件，再复制到该 Uri。
     private val createOutput = registerForActivityResult(
         ActivityResultContracts.CreateDocument("audio/mpeg")
     ) { uri ->
@@ -177,6 +185,7 @@ class AudioEditorActivity : ComponentActivity() {
     private fun loadAssetExample() {
         executor.execute {
             try {
+                // 示例资源也复制成普通临时文件，使示例和用户选择的音频走同一套 native 流程。
                 val file = File.createTempFile("editor-example-", ".mp3", cacheDir)
                 assets.open("music.mp3").use { input -> file.outputStream().use(input::copyTo) }
                 val track = readTrack(file, "示例音频 · music.mp3")
@@ -197,6 +206,7 @@ class AudioEditorActivity : ComponentActivity() {
         executor.execute {
             var temp: File? = null
             try {
+                // JNI 的 avformat_open_input 直接接收文件路径，不能直接打开 Android Uri。
                 temp = copyUriToCache(uri)
                 val name = displayName(uri) ?: "audio.mp3"
                 val track = readTrack(temp, name)
@@ -222,6 +232,7 @@ class AudioEditorActivity : ComponentActivity() {
     }
 
     private fun readTrack(file: File, name: String): Track {
+        // probe 提供时长；waveform 解码整段音频并返回固定数量的归一化峰值。
         val probe = FfmpegBridge.probe(file.absolutePath)
         val waveform = FfmpegBridge.waveform(file.absolutePath).toList()
         return Track(
@@ -241,6 +252,7 @@ class AudioEditorActivity : ComponentActivity() {
         previewTempFile = null
         executor.execute {
             try {
+                // 预览也是一次完整的 native 转码，生成的临时 MP3 交给播放器播放。
                 val output = File.createTempFile("editor-preview-", ".mp3", cacheDir)
                 FfmpegBridge.tempoPitch(
                     track.file.absolutePath,
@@ -266,6 +278,7 @@ class AudioEditorActivity : ComponentActivity() {
 
     private fun requestTrimExport(startMs: Long, endMs: Long) {
         val track = firstTrackState.value ?: return
+        // 先记录参数并打开系统保存器；用户确认路径后才开始执行 native 导出。
         pendingExport = ExportRequest(
             kind = ExportKind.TRIM,
             first = track.file,
@@ -294,6 +307,7 @@ class AudioEditorActivity : ComponentActivity() {
         executor.execute {
             val output = File.createTempFile("editor-export-", ".mp3", cacheDir)
             try {
+                // native 只能稳定地写普通路径，因此先写 cacheDir，再通过 ContentResolver 写入 SAF Uri。
                 when (request.kind) {
                     ExportKind.TRIM -> FfmpegBridge.trim(
                         request.first.absolutePath,
@@ -325,6 +339,7 @@ class AudioEditorActivity : ComponentActivity() {
     }
 
     private fun copyUriToCache(uri: Uri): File {
+        // 临时文件扩展名不参与 FFmpeg 解码格式判断，FFmpeg 会读取文件内容和容器信息。
         val file = File.createTempFile("editor-input-", ".audio", cacheDir)
         contentResolver.openInputStream(uri)?.use { input ->
             file.outputStream().use { output -> input.copyTo(output) }

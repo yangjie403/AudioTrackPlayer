@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
@@ -31,14 +32,19 @@ extern "C" {
 #include "libswresample/swresample.h"
 }
 
+// 本文件是 Android Kotlin 与 FFmpeg C API 之间的边界层。
+// Kotlin 只传入普通文件路径和基础数值；这里负责资源创建/释放、解码、滤镜、重采样、
+// FIFO 缓冲、编码、容器写入以及把 C++ 异常转换成 Java 异常。
 namespace {
 
+    // 将 FFmpeg 的负错误码转换为可读文本，所有 native 失败路径都尽量带上该信息。
     std::string ffmpegError(int error) {
         char buffer[AV_ERROR_MAX_STRING_SIZE] = {};
         av_strerror(error, buffer, sizeof(buffer));
         return std::string(buffer);
     }
 
+    // 处理音频文件、编码器或滤镜失败：Java 侧收到 IOException。
     void throwException(JNIEnv *env, const std::string &message) {
         jclass exceptionClass = env->FindClass("java/io/IOException");
         if (exceptionClass != nullptr) {
@@ -47,6 +53,7 @@ namespace {
         }
     }
 
+    // 处理 JNI 参数为空、区间无效等调用错误：Java 侧收到 IllegalArgumentException。
     void throwArgument(JNIEnv *env, const char *message) {
         jclass exceptionClass = env->FindClass("java/lang/IllegalArgumentException");
         if (exceptionClass != nullptr) {
@@ -128,6 +135,7 @@ namespace {
         return AVERROR_STREAM_NOT_FOUND;
     }
 
+    // 读取容器和最佳音频流的元数据，并以 JSON 字符串返回给 Kotlin。
     std::string probeFile(const std::string &path) {
         AVFormatContext *format = nullptr;
         int result = avformat_open_input(&format, path.c_str(), nullptr, nullptr);
@@ -256,6 +264,7 @@ namespace {
         av_channel_layout_default(target, channels > 0 ? channels : 2);
     }
 
+    // 从编码器持续取出压缩包。一次 send_frame 可能产生多个 packet，不能只取一次。
     void writeEncodedPackets(AVCodecContext *encoder,
                              AVFormatContext *output,
                              AVStream *stream,
@@ -276,6 +285,7 @@ namespace {
         }
     }
 
+    // 把一帧已经准备好格式和时间戳的 PCM 交给编码器，然后写出全部 packet。
     void encodeFrame(AVCodecContext *encoder,
                      AVFormatContext *output,
                      AVStream *stream,
@@ -769,6 +779,8 @@ namespace {
         closeInput(&input);
     }
 
+    // 一个滤镜输入对应一个独立的容器、解码器和 abuffer。拼接时会有两个实例，
+    // 裁剪/变速变调时只有一个实例。
     struct FilterInput {
         AVFormatContext *format = nullptr;
         AVCodecContext *decoder = nullptr;
@@ -788,6 +800,7 @@ namespace {
         input.source = nullptr;
     }
 
+    // 打开滤镜管线的输入文件并初始化解码器；此时还没有创建滤镜图。
     void openFilterInput(const std::string &path, FilterInput &input) {
         int result = avformat_open_input(&input.format, path.c_str(), nullptr, nullptr);
         if (result < 0) throw std::runtime_error("无法打开输入文件: " + ffmpegError(result));
@@ -816,6 +829,7 @@ namespace {
         return input.decoder->ch_layout.nb_channels == 1 ? "mono" : "stereo";
     }
 
+    // atempo 单次允许的倍率范围是 0.5～2.0。超出范围时拆成多个 atempo 串联。
     void appendAtempo(std::ostringstream &filters, double factor) {
         if (!std::isfinite(factor) || factor <= 0.0) {
             throw std::runtime_error("变速参数无效");
@@ -833,10 +847,53 @@ namespace {
         }
     }
 
+    // 所有编辑滤镜统一输出格式，保证 sink、FIFO、编码器对样本内存的解释一致。
     std::string fixedAudioFormat() {
         return "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo";
     }
 
+    // 对完整、无需处理的 MP3 执行字节级复制，保留原始编码数据和元数据。
+    void copyBinaryFile(const std::string &inputPath, const std::string &outputPath) {
+        if (inputPath == outputPath) {
+            throw std::runtime_error("输入文件和输出文件不能相同");
+        }
+        std::ifstream input(inputPath, std::ios::binary);
+        if (!input.is_open()) throw std::runtime_error("无法读取输入音频");
+        std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
+        if (!output.is_open()) throw std::runtime_error("无法创建输出音频");
+        output << input.rdbuf();
+        if (!output.good()) throw std::runtime_error("复制音频文件失败");
+    }
+
+    // 获取快速复制判断所需的输入时长，优先使用容器时长，再回退到流时长。
+    int64_t filterInputDurationMs(const FilterInput &input) {
+        if (input.format->duration != AV_NOPTS_VALUE && input.format->duration > 0) {
+            return av_rescale_q(
+                    input.format->duration,
+                    AVRational{1, AV_TIME_BASE},
+                    AVRational{1, 1000});
+        }
+        if (input.stream->duration != AV_NOPTS_VALUE && input.stream->duration > 0) {
+            return av_rescale_q(
+                    input.stream->duration,
+                    input.stream->time_base,
+                    AVRational{1, 1000});
+        }
+        return 0;
+    }
+
+    // 判断一次编辑是否等价于“完整 MP3 原样输出”，只有这种情况才允许绕过转码。
+    bool canCopyWholeMp3(const FilterInput &input,
+                         int64_t startMs,
+                         int64_t endMs) {
+        const bool isMp3 = input.format->iformat != nullptr &&
+                           std::strcmp(input.format->iformat->name, "mp3") == 0;
+        const int64_t durationMs = filterInputDurationMs(input);
+        // 只有整段 MP3 且没有任何处理时才能直接复制，避免无意义的二次编码。
+        return isMp3 && startMs == 0 && durationMs > 0 && endMs >= durationMs - 1;
+    }
+
+    // 生成单输入编辑滤镜：裁剪 -> 时间戳归零 -> 可选变调 -> 速度补偿 -> 固定格式。
     std::string buildSingleFilter(const FilterInput &input,
                                   int64_t startMs,
                                   int64_t endMs,
@@ -852,8 +909,8 @@ namespace {
             const int shiftedRate = std::max(
                     1000,
                     static_cast<int>(std::llround(input.decoder->sample_rate * pitchRatio)));
-            // asetrate raises/lowers pitch; aresample restores the output sample rate;
-            // the following atempo compensation keeps pitch and speed independently tunable.
+            // asetrate 调整音调，aresample 恢复输出采样率；后面的 atempo
+            // 抵消由音调变化带来的速度变化，从而实现速度和音调独立控制。
             filters << "asetrate=" << shiftedRate << ",aresample=44100,";
         }
         appendAtempo(filters, speed / pitchRatio);
@@ -861,6 +918,7 @@ namespace {
         return filters.str();
     }
 
+    // 创建 abuffer/abuffersink，并限制 sink 输出为 fltp、44100 Hz、stereo。
     void configureFilterSources(AVFilterGraph *graph,
                                 std::vector<FilterInput> &inputs,
                                 AVFilterContext *&sink) {
@@ -927,6 +985,7 @@ namespace {
         return true;
     }
 
+    // 从 sink 排出滤镜生成的音频帧，先写入 FIFO，再按 MP3 frame_size 组帧编码。
     void consumeFilteredFrames(AVFilterContext *sink,
                                 AVAudioFifo *fifo,
                                 AVCodecContext *encoder,
@@ -968,6 +1027,8 @@ namespace {
         }
     }
 
+    // 执行带音频滤镜的统一处理管线。filterDescription 使用 FFmpeg filtergraph 语法，
+    // 输入端名称是 in0、in1，输出端名称是 out。
     void transcodeFiltered(const std::vector<std::string> &inputPaths,
                            const std::string &outputPath,
                            const std::string &filterDescription) {
@@ -998,8 +1059,21 @@ namespace {
             encoder = avcodec_alloc_context3(encoderCodec);
             if (encoder == nullptr) throw std::runtime_error("无法分配 MP3 编码器上下文");
             encoder->sample_rate = 44100;
-            encoder->sample_fmt = firstEncoderSampleFormat(encoderCodec);
-            encoder->bit_rate = 192000;
+            // 滤镜末端固定输出 fltp，编码器、FIFO 必须使用完全相同的采样格式。
+            // 之前这里取编码器支持列表的第一个格式，libmp3lame 在当前构建中
+            // 返回 s32p，导致 fltp 数据按 s32p 解释，最终产生严重滋滋声。
+            encoder->sample_fmt = AV_SAMPLE_FMT_FLTP;
+            int64_t outputBitRate = 0;
+            for (const FilterInput &input : inputs) {
+                const int64_t inputBitRate = input.decoder->bit_rate > 0
+                        ? input.decoder->bit_rate
+                        : input.format->bit_rate;
+                if (inputBitRate > 0) outputBitRate = std::max(outputBitRate, inputBitRate);
+            }
+            if (outputBitRate <= 0) outputBitRate = 192000;
+            // 单段转码尽量保持源 MP3 码率；多段拼接使用输入中的最高码率，避免
+            // 拼接后被意外降到固定的 192 kbps。MP3 编码器支持的范围为 32～320 kbps。
+            encoder->bit_rate = std::clamp<int64_t>(outputBitRate, 32000, 320000);
             encoder->time_base = AVRational{1, encoder->sample_rate};
             av_channel_layout_default(&encoder->ch_layout, 2);
             result = avcodec_open2(encoder, encoderCodec, nullptr);
@@ -1168,6 +1242,7 @@ namespace {
         for (FilterInput &input : inputs) closeFilterInput(input);
     }
 
+    // 将一个 packed sample 转为 -1～1 附近的浮点值，供波形峰值统计使用。
     float sampleToFloat(const uint8_t *data, enum AVSampleFormat packedFormat) {
         switch (packedFormat) {
             case AV_SAMPLE_FMT_U8:
@@ -1187,6 +1262,7 @@ namespace {
         }
     }
 
+    // 解码整段音频，按每个解码帧统计所有声道峰值，再压缩为 pointCount 个波形点。
     std::vector<float> waveformFile(const std::string &path, int pointCount) {
         FilterInput input;
         AVPacket *packet = nullptr;
@@ -1266,6 +1342,8 @@ namespace {
 
 } // namespace
 
+// 以下 JNI 函数是 FfmpegBridge.kt 中 external 方法的实际实现。
+// 方法名遵循 JNI 静态命名规则：Java_<包名>_<对象名>_<方法名>。
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_bigjelly_temporun_player_FfmpegBridge_nativeVersion(
         JNIEnv *env,
@@ -1286,6 +1364,7 @@ Java_com_bigjelly_temporun_player_FfmpegBridge_nativeProbe(
         JNIEnv *env,
         jobject,
         jstring path) {
+    // probe 只返回元数据，不创建输出文件；失败时通过 JNI 抛回 IOException。
     if (path == nullptr) {
         throwArgument(env, "path must not be null");
         return nullptr;
@@ -1306,6 +1385,7 @@ Java_com_bigjelly_temporun_player_FfmpegBridge_nativeConvert(
         jstring inputPath,
         jstring outputPath,
         jstring targetFormat) {
+    // 通用转码入口：输入解码为 PCM，经 SwrContext 适配后交给目标编码器。
     if (inputPath == nullptr || outputPath == nullptr || targetFormat == nullptr) {
         throwArgument(env, "Conversion arguments must not be null");
         return;
@@ -1324,6 +1404,7 @@ Java_com_bigjelly_temporun_player_FfmpegBridge_nativeWaveform(
         jobject,
         jstring path,
         jint pointCount) {
+    // JNI 数组只在成功路径创建；异常路径返回 nullptr，并保留 Java 异常状态。
     if (path == nullptr || pointCount <= 0) {
         throwArgument(env, "Invalid waveform arguments");
         return nullptr;
@@ -1349,6 +1430,8 @@ Java_com_bigjelly_temporun_player_FfmpegBridge_nativeTrim(
         jstring outputPath,
         jlong startMs,
         jlong endMs) {
+    // 裁剪没有速度/变调参数，因此固定调用 speed=1、pitch=0 的单输入滤镜。
+    // 完整 MP3 命中快速路径时会直接复制二进制文件，不重新编码。
     if (inputPath == nullptr || outputPath == nullptr || endMs <= startMs || startMs < 0) {
         throwArgument(env, "Invalid trim arguments");
         return;
@@ -1359,6 +1442,11 @@ Java_com_bigjelly_temporun_player_FfmpegBridge_nativeTrim(
         FilterInput metadata;
         try {
             openFilterInput(input, metadata);
+            if (canCopyWholeMp3(metadata, startMs, endMs)) {
+                copyBinaryFile(input, output);
+                closeFilterInput(metadata);
+                return;
+            }
             const std::string filter = buildSingleFilter(
                     metadata, startMs, endMs, 1.0, 0.0);
             closeFilterInput(metadata);
@@ -1382,6 +1470,7 @@ Java_com_bigjelly_temporun_player_FfmpegBridge_nativeTempoPitch(
         jlong endMs,
         jdouble speed,
         jdouble pitchSemitones) {
+    // 速度和变调都在 native 层再次校验，不能只依赖 Kotlin UI 的 Slider 范围。
     if (inputPath == nullptr || outputPath == nullptr || endMs <= startMs ||
         startMs < 0 || !std::isfinite(speed) || speed <= 0.0 ||
         !std::isfinite(pitchSemitones)) {
@@ -1394,6 +1483,13 @@ Java_com_bigjelly_temporun_player_FfmpegBridge_nativeTempoPitch(
         FilterInput metadata;
         try {
             openFilterInput(input, metadata);
+            if (std::abs(speed - 1.0) <= 0.000001 &&
+                std::abs(pitchSemitones) <= 0.000001 &&
+                canCopyWholeMp3(metadata, startMs, endMs)) {
+                copyBinaryFile(input, output);
+                closeFilterInput(metadata);
+                return;
+            }
             const std::string filter = buildSingleFilter(
                     metadata, startMs, endMs, speed, pitchSemitones);
             closeFilterInput(metadata);
@@ -1414,6 +1510,7 @@ Java_com_bigjelly_temporun_player_FfmpegBridge_nativeConcat(
         jstring firstInputPath,
         jstring secondInputPath,
         jstring outputPath) {
+    // 两个输入分别绑定到 in0/in1，滤镜 concat 按输入顺序生成一个连续音频流。
     if (firstInputPath == nullptr || secondInputPath == nullptr || outputPath == nullptr) {
         throwArgument(env, "Invalid concat arguments");
         return;
