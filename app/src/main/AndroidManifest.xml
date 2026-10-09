@@ -30,6 +30,10 @@
         <activity
             android:name=".AudioConvertActivity"
             android:exported="true">
+        </activity>
+        <activity
+            android:name=".AudioEditorActivity"
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

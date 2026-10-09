@@ -6,8 +6,12 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <cmath>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 extern "C" {
 #include "libavcodec/avcodec.h"
@@ -21,6 +25,9 @@ extern "C" {
 #include "libavutil/mathematics.h"
 #include "libavutil/opt.h"
 #include "libavutil/samplefmt.h"
+#include "libavfilter/avfilter.h"
+#include "libavfilter/buffersink.h"
+#include "libavfilter/buffersrc.h"
 #include "libswresample/swresample.h"
 }
 
@@ -762,6 +769,501 @@ namespace {
         closeInput(&input);
     }
 
+    struct FilterInput {
+        AVFormatContext *format = nullptr;
+        AVCodecContext *decoder = nullptr;
+        AVStream *stream = nullptr;
+        int audioIndex = -1;
+        AVFilterContext *source = nullptr;
+        int64_t nextPts = 0;
+        // atrim 可能在解码器读到输入文件 EOF 之前就关闭下游滤镜图。
+        // source 返回 AVERROR_EOF 后，不能再向它写入后续解码帧。
+        bool sourceEnded = false;
+    };
+
+    void closeFilterInput(FilterInput &input) {
+        avcodec_free_context(&input.decoder);
+        closeInput(&input.format);
+        input.stream = nullptr;
+        input.source = nullptr;
+    }
+
+    void openFilterInput(const std::string &path, FilterInput &input) {
+        int result = avformat_open_input(&input.format, path.c_str(), nullptr, nullptr);
+        if (result < 0) throw std::runtime_error("无法打开输入文件: " + ffmpegError(result));
+        result = avformat_find_stream_info(input.format, nullptr);
+        if (result < 0) throw std::runtime_error("无法读取输入文件信息: " + ffmpegError(result));
+
+        input.audioIndex = findAudioStream(input.format);
+        if (input.audioIndex < 0) throw std::runtime_error("文件中没有音频流");
+        input.stream = input.format->streams[input.audioIndex];
+        const AVCodec *codec = avcodec_find_decoder(input.stream->codecpar->codec_id);
+        if (codec == nullptr) throw std::runtime_error("找不到输入音频解码器");
+        input.decoder = avcodec_alloc_context3(codec);
+        if (input.decoder == nullptr) throw std::runtime_error("无法分配解码器上下文");
+        result = avcodec_parameters_to_context(input.decoder, input.stream->codecpar);
+        if (result < 0) throw std::runtime_error("无法配置解码器: " + ffmpegError(result));
+        result = avcodec_open2(input.decoder, codec, nullptr);
+        if (result < 0) throw std::runtime_error("无法打开解码器: " + ffmpegError(result));
+        if (input.decoder->sample_rate <= 0 || input.decoder->ch_layout.nb_channels <= 0) {
+            throw std::runtime_error("输入音频参数无效");
+        }
+    }
+
+    std::string inputChannelLayout(const FilterInput &input) {
+        std::string layout = channelLayoutName(input.decoder->ch_layout);
+        if (!layout.empty()) return layout;
+        return input.decoder->ch_layout.nb_channels == 1 ? "mono" : "stereo";
+    }
+
+    void appendAtempo(std::ostringstream &filters, double factor) {
+        if (!std::isfinite(factor) || factor <= 0.0) {
+            throw std::runtime_error("变速参数无效");
+        }
+        while (factor < 0.5) {
+            filters << "atempo=0.5,";
+            factor /= 0.5;
+        }
+        while (factor > 2.0) {
+            filters << "atempo=2.0,";
+            factor /= 2.0;
+        }
+        if (std::abs(factor - 1.0) > 0.000001) {
+            filters << "atempo=" << std::fixed << std::setprecision(6) << factor << ",";
+        }
+    }
+
+    std::string fixedAudioFormat() {
+        return "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo";
+    }
+
+    std::string buildSingleFilter(const FilterInput &input,
+                                  int64_t startMs,
+                                  int64_t endMs,
+                                  double speed,
+                                  double pitchSemitones) {
+        const double start = static_cast<double>(startMs) / 1000.0;
+        const double end = static_cast<double>(endMs) / 1000.0;
+        const double pitchRatio = std::pow(2.0, pitchSemitones / 12.0);
+        std::ostringstream filters;
+        filters << "[in0]atrim=start=" << std::fixed << std::setprecision(6) << start
+                << ":end=" << end << ",asetpts=PTS-STARTPTS,";
+        if (std::abs(pitchRatio - 1.0) > 0.000001) {
+            const int shiftedRate = std::max(
+                    1000,
+                    static_cast<int>(std::llround(input.decoder->sample_rate * pitchRatio)));
+            // asetrate raises/lowers pitch; aresample restores the output sample rate;
+            // the following atempo compensation keeps pitch and speed independently tunable.
+            filters << "asetrate=" << shiftedRate << ",aresample=44100,";
+        }
+        appendAtempo(filters, speed / pitchRatio);
+        filters << fixedAudioFormat() << "[out]";
+        return filters.str();
+    }
+
+    void configureFilterSources(AVFilterGraph *graph,
+                                std::vector<FilterInput> &inputs,
+                                AVFilterContext *&sink) {
+        const AVFilter *bufferFilter = avfilter_get_by_name("abuffer");
+        const AVFilter *sinkFilter = avfilter_get_by_name("abuffersink");
+        if (bufferFilter == nullptr || sinkFilter == nullptr) {
+            throw std::runtime_error("FFmpeg 音频滤镜不可用");
+        }
+
+        for (size_t index = 0; index < inputs.size(); ++index) {
+            const char *sampleFormat = av_get_sample_fmt_name(inputs[index].decoder->sample_fmt);
+            if (sampleFormat == nullptr) throw std::runtime_error("输入采样格式无效");
+            std::ostringstream args;
+            args << "time_base=1/" << inputs[index].decoder->sample_rate
+                 << ":sample_rate=" << inputs[index].decoder->sample_rate
+                 << ":sample_fmt=" << sampleFormat
+                 << ":channel_layout=" << inputChannelLayout(inputs[index]);
+            const std::string name = "in" + std::to_string(index);
+            int result = avfilter_graph_create_filter(
+                    &inputs[index].source,
+                    bufferFilter,
+                    name.c_str(),
+                    args.str().c_str(),
+                    nullptr,
+                    graph);
+            if (result < 0) throw std::runtime_error("无法创建音频滤镜输入: " + ffmpegError(result));
+        }
+
+        int result = avfilter_graph_create_filter(
+                &sink,
+                sinkFilter,
+                "out",
+                nullptr,
+                nullptr,
+                graph);
+        if (result < 0) throw std::runtime_error("无法创建音频滤镜输出: " + ffmpegError(result));
+
+        const int sampleFormats[] = {AV_SAMPLE_FMT_FLTP, AV_SAMPLE_FMT_NONE};
+        const int sampleRates[] = {44100, -1};
+        result = av_opt_set_int_list(
+                sink, "sample_fmts", sampleFormats, AV_SAMPLE_FMT_NONE, AV_OPT_SEARCH_CHILDREN);
+        if (result < 0) throw std::runtime_error("无法设置滤镜采样格式: " + ffmpegError(result));
+        result = av_opt_set_int_list(
+                sink, "sample_rates", sampleRates, -1, AV_OPT_SEARCH_CHILDREN);
+        if (result < 0) throw std::runtime_error("无法设置滤镜采样率: " + ffmpegError(result));
+        result = av_opt_set(sink, "ch_layouts", "stereo", AV_OPT_SEARCH_CHILDREN);
+        if (result < 0) throw std::runtime_error("无法设置滤镜声道布局: " + ffmpegError(result));
+    }
+
+    // atrim 这类有结束边界的滤镜可能早于解码器到达 EOF。
+    // 这里将其视为当前滤镜输入的正常结束，而不是输入文件错误；调用方随后停止
+    // 继续喂入解码帧，并排空 sink 中已经生成的选区数据。
+    bool pushFrameToFilter(FilterInput &input, AVFrame *frame) {
+        if (input.sourceEnded) return false;
+        const int result = av_buffersrc_add_frame_flags(
+                input.source, frame, AV_BUFFERSRC_FLAG_KEEP_REF);
+        if (result == AVERROR_EOF) {
+            input.sourceEnded = true;
+            return false;
+        }
+        if (result < 0) {
+            throw std::runtime_error("写入音频滤镜失败: " + ffmpegError(result));
+        }
+        return true;
+    }
+
+    void consumeFilteredFrames(AVFilterContext *sink,
+                                AVAudioFifo *fifo,
+                                AVCodecContext *encoder,
+                                AVFormatContext *output,
+                                AVStream *stream,
+                                AVPacket *packet,
+                                int64_t *nextPts,
+                                bool untilEof) {
+        AVFrame *filtered = av_frame_alloc();
+        if (filtered == nullptr) throw std::runtime_error("无法分配滤镜输出帧");
+        while (true) {
+            const int result = av_buffersink_get_frame(sink, filtered);
+            if (result == AVERROR(EAGAIN)) {
+                if (untilEof) {
+                    av_frame_free(&filtered);
+                    throw std::runtime_error("滤镜输出未完成");
+                }
+                break;
+            }
+            if (result == AVERROR_EOF) break;
+            if (result < 0) {
+                av_frame_free(&filtered);
+                throw std::runtime_error("读取滤镜输出失败: " + ffmpegError(result));
+            }
+            const int written = av_audio_fifo_write(
+                    fifo,
+                    reinterpret_cast<void **>(filtered->extended_data),
+                    filtered->nb_samples);
+            if (written < filtered->nb_samples) {
+                av_frame_free(&filtered);
+                throw std::runtime_error("写入滤镜 FIFO 失败");
+            }
+            encodeAvailableFifo(fifo, encoder, output, stream, packet, nextPts, false);
+            av_frame_unref(filtered);
+        }
+        av_frame_free(&filtered);
+        if (untilEof) {
+            encodeAvailableFifo(fifo, encoder, output, stream, packet, nextPts, true);
+        }
+    }
+
+    void transcodeFiltered(const std::vector<std::string> &inputPaths,
+                           const std::string &outputPath,
+                           const std::string &filterDescription) {
+        if (inputPaths.empty()) throw std::runtime_error("没有输入音频");
+
+        std::vector<FilterInput> inputs(inputPaths.size());
+        AVFilterGraph *graph = nullptr;
+        AVFilterContext *sink = nullptr;
+        AVFormatContext *output = nullptr;
+        AVCodecContext *encoder = nullptr;
+        AVAudioFifo *fifo = nullptr;
+        AVPacket *packet = nullptr;
+        AVFrame *decoded = nullptr;
+        bool headerWritten = false;
+
+        try {
+            for (size_t i = 0; i < inputPaths.size(); ++i) {
+                openFilterInput(inputPaths[i], inputs[i]);
+            }
+
+            const AVCodec *encoderCodec = avcodec_find_encoder_by_name("libmp3lame");
+            if (encoderCodec == nullptr) throw std::runtime_error("找不到 MP3 编码器");
+            int result = avformat_alloc_output_context2(
+                    &output, nullptr, "mp3", outputPath.c_str());
+            if (result < 0 || output == nullptr) {
+                throw std::runtime_error("无法创建 MP3 输出容器: " + ffmpegError(result));
+            }
+            encoder = avcodec_alloc_context3(encoderCodec);
+            if (encoder == nullptr) throw std::runtime_error("无法分配 MP3 编码器上下文");
+            encoder->sample_rate = 44100;
+            encoder->sample_fmt = firstEncoderSampleFormat(encoderCodec);
+            encoder->bit_rate = 192000;
+            encoder->time_base = AVRational{1, encoder->sample_rate};
+            av_channel_layout_default(&encoder->ch_layout, 2);
+            result = avcodec_open2(encoder, encoderCodec, nullptr);
+            if (result < 0) throw std::runtime_error("无法打开 MP3 编码器: " + ffmpegError(result));
+
+            AVStream *outputStream = avformat_new_stream(output, nullptr);
+            if (outputStream == nullptr) throw std::runtime_error("无法创建输出音频流");
+            outputStream->time_base = encoder->time_base;
+            result = avcodec_parameters_from_context(outputStream->codecpar, encoder);
+            if (result < 0) throw std::runtime_error("无法设置输出音频参数: " + ffmpegError(result));
+            if ((output->oformat->flags & AVFMT_NOFILE) == 0) {
+                result = avio_open(&output->pb, outputPath.c_str(), AVIO_FLAG_WRITE);
+                if (result < 0) throw std::runtime_error("无法创建输出文件: " + ffmpegError(result));
+            }
+            result = avformat_write_header(output, nullptr);
+            if (result < 0) throw std::runtime_error("无法写入输出文件头: " + ffmpegError(result));
+            headerWritten = true;
+
+            graph = avfilter_graph_alloc();
+            if (graph == nullptr) throw std::runtime_error("无法创建音频滤镜图");
+            configureFilterSources(graph, inputs, sink);
+
+            AVFilterInOut *graphInputs = avfilter_inout_alloc();
+            AVFilterInOut *graphOutputs = nullptr;
+            if (graphInputs == nullptr) throw std::runtime_error("无法分配滤镜连接");
+            graphInputs->name = av_strdup("out");
+            graphInputs->filter_ctx = sink;
+            graphInputs->pad_idx = 0;
+            for (int index = static_cast<int>(inputs.size()) - 1; index >= 0; --index) {
+                AVFilterInOut *outputLink = avfilter_inout_alloc();
+                if (outputLink == nullptr) {
+                    avfilter_inout_free(&graphInputs);
+                    throw std::runtime_error("无法分配滤镜输入连接");
+                }
+                outputLink->name = av_strdup(("in" + std::to_string(index)).c_str());
+                outputLink->filter_ctx = inputs[index].source;
+                outputLink->pad_idx = 0;
+                outputLink->next = graphOutputs;
+                graphOutputs = outputLink;
+            }
+            result = avfilter_graph_parse_ptr(
+                    graph, filterDescription.c_str(), &graphInputs, &graphOutputs, nullptr);
+            avfilter_inout_free(&graphInputs);
+            avfilter_inout_free(&graphOutputs);
+            if (result < 0) throw std::runtime_error("解析音频滤镜失败: " + ffmpegError(result));
+            result = avfilter_graph_config(graph, nullptr);
+            if (result < 0) throw std::runtime_error("配置音频滤镜失败: " + ffmpegError(result));
+
+            fifo = av_audio_fifo_alloc(
+                    encoder->sample_fmt,
+                    encoder->ch_layout.nb_channels,
+                    std::max(encoder->frame_size, 1024));
+            packet = av_packet_alloc();
+            decoded = av_frame_alloc();
+            if (fifo == nullptr || packet == nullptr || decoded == nullptr) {
+                throw std::runtime_error("无法分配音频处理缓冲区");
+            }
+
+            int64_t nextPts = 0;
+            for (FilterInput &input : inputs) {
+                avformat_seek_file(input.format, input.audioIndex, INT64_MIN, 0, INT64_MAX, 0);
+                while (!input.sourceEnded && (result = av_read_frame(input.format, packet)) >= 0) {
+                    if (packet->stream_index == input.audioIndex) {
+                        result = avcodec_send_packet(input.decoder, packet);
+                        if (result < 0) throw std::runtime_error("提交解码数据失败: " + ffmpegError(result));
+                        while (!input.sourceEnded &&
+                               (result = avcodec_receive_frame(input.decoder, decoded)) >= 0) {
+                            int64_t timestamp = decoded->best_effort_timestamp;
+                            if (timestamp == AV_NOPTS_VALUE) timestamp = decoded->pts;
+                            if (timestamp != AV_NOPTS_VALUE) {
+                                decoded->pts = av_rescale_q(
+                                        timestamp,
+                                        input.stream->time_base,
+                                        AVRational{1, input.decoder->sample_rate});
+                            } else {
+                                decoded->pts = input.nextPts;
+                            }
+                            input.nextPts = decoded->pts + decoded->nb_samples;
+                            if (!pushFrameToFilter(input, decoded)) {
+                                av_frame_unref(decoded);
+                                break;
+                            }
+                            consumeFilteredFrames(
+                                    sink, fifo, encoder, output, outputStream, packet, &nextPts, false);
+                            av_frame_unref(decoded);
+                        }
+                        if (!input.sourceEnded &&
+                            result != AVERROR(EAGAIN) && result != AVERROR_EOF) {
+                            throw std::runtime_error("解码音频失败: " + ffmpegError(result));
+                        }
+                    }
+                    av_packet_unref(packet);
+                }
+                if (!input.sourceEnded && result != AVERROR_EOF) {
+                    throw std::runtime_error("读取音频数据失败: " + ffmpegError(result));
+                }
+                if (!input.sourceEnded) {
+                    result = avcodec_send_packet(input.decoder, nullptr);
+                    if (result < 0) throw std::runtime_error("刷新解码器失败: " + ffmpegError(result));
+                    while (!input.sourceEnded &&
+                           (result = avcodec_receive_frame(input.decoder, decoded)) >= 0) {
+                        decoded->pts = input.nextPts;
+                        input.nextPts += decoded->nb_samples;
+                        if (!pushFrameToFilter(input, decoded)) {
+                            av_frame_unref(decoded);
+                            break;
+                        }
+                        consumeFilteredFrames(
+                                sink, fifo, encoder, output, outputStream, packet, &nextPts, false);
+                        av_frame_unref(decoded);
+                    }
+                    if (!input.sourceEnded &&
+                        result != AVERROR(EAGAIN) && result != AVERROR_EOF) {
+                        throw std::runtime_error("刷新解码器失败: " + ffmpegError(result));
+                    }
+                }
+                if (!input.sourceEnded) {
+                    result = av_buffersrc_add_frame_flags(input.source, nullptr, 0);
+                    if (result == AVERROR_EOF) {
+                        input.sourceEnded = true;
+                    } else if (result < 0) {
+                        throw std::runtime_error("结束音频滤镜输入失败: " + ffmpegError(result));
+                    }
+                }
+                consumeFilteredFrames(
+                        sink, fifo, encoder, output, outputStream, packet, &nextPts, false);
+            }
+
+            consumeFilteredFrames(
+                    sink, fifo, encoder, output, outputStream, packet, &nextPts, true);
+            encodeAvailableFifo(fifo, encoder, output, outputStream, packet, &nextPts, true);
+            result = avcodec_send_frame(encoder, nullptr);
+            if (result < 0 && result != AVERROR_EOF) {
+                throw std::runtime_error("刷新 MP3 编码器失败: " + ffmpegError(result));
+            }
+            writeEncodedPackets(encoder, output, outputStream, packet);
+            if (headerWritten) {
+                result = av_write_trailer(output);
+                if (result < 0) throw std::runtime_error("无法写入输出文件尾: " + ffmpegError(result));
+            }
+        } catch (...) {
+            av_frame_free(&decoded);
+            av_packet_free(&packet);
+            av_audio_fifo_free(fifo);
+            avfilter_graph_free(&graph);
+            avcodec_free_context(&encoder);
+            if (output != nullptr && output->pb != nullptr &&
+                (output->oformat->flags & AVFMT_NOFILE) == 0) {
+                avio_closep(&output->pb);
+            }
+            if (output != nullptr) avformat_free_context(output);
+            for (FilterInput &input : inputs) closeFilterInput(input);
+            throw;
+        }
+
+        av_frame_free(&decoded);
+        av_packet_free(&packet);
+        av_audio_fifo_free(fifo);
+        avfilter_graph_free(&graph);
+        avcodec_free_context(&encoder);
+        if (output != nullptr && output->pb != nullptr &&
+            (output->oformat->flags & AVFMT_NOFILE) == 0) {
+            avio_closep(&output->pb);
+        }
+        if (output != nullptr) avformat_free_context(output);
+        for (FilterInput &input : inputs) closeFilterInput(input);
+    }
+
+    float sampleToFloat(const uint8_t *data, enum AVSampleFormat packedFormat) {
+        switch (packedFormat) {
+            case AV_SAMPLE_FMT_U8:
+                return (static_cast<int>(*data) - 128) / 128.0f;
+            case AV_SAMPLE_FMT_S16:
+                return *reinterpret_cast<const int16_t *>(data) / 32768.0f;
+            case AV_SAMPLE_FMT_S32:
+                return static_cast<float>(*reinterpret_cast<const int32_t *>(data) / 2147483648.0);
+            case AV_SAMPLE_FMT_S64:
+                return static_cast<float>(*reinterpret_cast<const int64_t *>(data) / 9223372036854775808.0);
+            case AV_SAMPLE_FMT_FLT:
+                return *reinterpret_cast<const float *>(data);
+            case AV_SAMPLE_FMT_DBL:
+                return static_cast<float>(*reinterpret_cast<const double *>(data));
+            default:
+                return 0.0f;
+        }
+    }
+
+    std::vector<float> waveformFile(const std::string &path, int pointCount) {
+        FilterInput input;
+        AVPacket *packet = nullptr;
+        AVFrame *frame = nullptr;
+        std::vector<float> framePeaks;
+        try {
+            openFilterInput(path, input);
+            packet = av_packet_alloc();
+            frame = av_frame_alloc();
+            if (packet == nullptr || frame == nullptr) throw std::runtime_error("无法分配波形缓冲区");
+            const enum AVSampleFormat packedFormat = av_get_packed_sample_fmt(input.decoder->sample_fmt);
+            const int bytesPerSample = av_get_bytes_per_sample(packedFormat);
+            const bool planar = av_sample_fmt_is_planar(input.decoder->sample_fmt) != 0;
+            if (bytesPerSample <= 0) throw std::runtime_error("不支持的波形采样格式");
+
+            auto collect = [&]() {
+                float peak = 0.0f;
+                const int channels = input.decoder->ch_layout.nb_channels;
+                for (int sample = 0; sample < frame->nb_samples; ++sample) {
+                    for (int channel = 0; channel < channels; ++channel) {
+                        const uint8_t *data = planar
+                                ? frame->extended_data[channel] + sample * bytesPerSample
+                                : frame->extended_data[0] +
+                                  (sample * channels + channel) * bytesPerSample;
+                        peak = std::max(peak, std::abs(sampleToFloat(data, packedFormat)));
+                    }
+                }
+                framePeaks.push_back(std::min(1.0f, peak));
+            };
+
+            int result;
+            while ((result = av_read_frame(input.format, packet)) >= 0) {
+                if (packet->stream_index == input.audioIndex) {
+                    result = avcodec_send_packet(input.decoder, packet);
+                    if (result < 0) throw std::runtime_error("提交波形解码数据失败: " + ffmpegError(result));
+                    while ((result = avcodec_receive_frame(input.decoder, frame)) >= 0) {
+                        collect();
+                        av_frame_unref(frame);
+                    }
+                    if (result != AVERROR(EAGAIN) && result != AVERROR_EOF) {
+                        throw std::runtime_error("解码波形失败: " + ffmpegError(result));
+                    }
+                }
+                av_packet_unref(packet);
+            }
+            if (result != AVERROR_EOF) throw std::runtime_error("读取波形失败: " + ffmpegError(result));
+            result = avcodec_send_packet(input.decoder, nullptr);
+            if (result < 0) throw std::runtime_error("刷新波形解码器失败: " + ffmpegError(result));
+            while ((result = avcodec_receive_frame(input.decoder, frame)) >= 0) {
+                collect();
+                av_frame_unref(frame);
+            }
+            if (result != AVERROR(EAGAIN) && result != AVERROR_EOF) {
+                throw std::runtime_error("刷新波形失败: " + ffmpegError(result));
+            }
+        } catch (...) {
+            av_frame_free(&frame);
+            av_packet_free(&packet);
+            closeFilterInput(input);
+            throw;
+        }
+        av_frame_free(&frame);
+        av_packet_free(&packet);
+        closeFilterInput(input);
+
+        std::vector<float> waveform(std::max(pointCount, 1), 0.0f);
+        if (framePeaks.empty()) return waveform;
+        for (size_t point = 0; point < waveform.size(); ++point) {
+            const size_t begin = point * framePeaks.size() / waveform.size();
+            const size_t end = std::max(begin + 1, (point + 1) * framePeaks.size() / waveform.size());
+            for (size_t index = begin; index < std::min(end, framePeaks.size()); ++index) {
+                waveform[point] = std::max(waveform[point], framePeaks[index]);
+            }
+        }
+        return waveform;
+    }
+
 } // namespace
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -811,6 +1313,121 @@ Java_com_bigjelly_temporun_player_FfmpegBridge_nativeConvert(
     try {
         transcodeFile(jstringValue(env, inputPath), jstringValue(env, outputPath),
                       jstringValue(env, targetFormat));
+    } catch (const std::exception &error) {
+        throwException(env, error.what());
+    }
+}
+
+extern "C" JNIEXPORT jfloatArray JNICALL
+Java_com_bigjelly_temporun_player_FfmpegBridge_nativeWaveform(
+        JNIEnv *env,
+        jobject,
+        jstring path,
+        jint pointCount) {
+    if (path == nullptr || pointCount <= 0) {
+        throwArgument(env, "Invalid waveform arguments");
+        return nullptr;
+    }
+    try {
+        const std::vector<float> values = waveformFile(jstringValue(env, path), pointCount);
+        jfloatArray result = env->NewFloatArray(static_cast<jsize>(values.size()));
+        if (result == nullptr) return nullptr;
+        env->SetFloatArrayRegion(
+                result, 0, static_cast<jsize>(values.size()), values.data());
+        return result;
+    } catch (const std::exception &error) {
+        throwException(env, error.what());
+        return nullptr;
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_bigjelly_temporun_player_FfmpegBridge_nativeTrim(
+        JNIEnv *env,
+        jobject,
+        jstring inputPath,
+        jstring outputPath,
+        jlong startMs,
+        jlong endMs) {
+    if (inputPath == nullptr || outputPath == nullptr || endMs <= startMs || startMs < 0) {
+        throwArgument(env, "Invalid trim arguments");
+        return;
+    }
+    try {
+        const std::string input = jstringValue(env, inputPath);
+        const std::string output = jstringValue(env, outputPath);
+        FilterInput metadata;
+        try {
+            openFilterInput(input, metadata);
+            const std::string filter = buildSingleFilter(
+                    metadata, startMs, endMs, 1.0, 0.0);
+            closeFilterInput(metadata);
+            transcodeFiltered({input}, output, filter);
+        } catch (...) {
+            closeFilterInput(metadata);
+            throw;
+        }
+    } catch (const std::exception &error) {
+        throwException(env, error.what());
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_bigjelly_temporun_player_FfmpegBridge_nativeTempoPitch(
+        JNIEnv *env,
+        jobject,
+        jstring inputPath,
+        jstring outputPath,
+        jlong startMs,
+        jlong endMs,
+        jdouble speed,
+        jdouble pitchSemitones) {
+    if (inputPath == nullptr || outputPath == nullptr || endMs <= startMs ||
+        startMs < 0 || !std::isfinite(speed) || speed <= 0.0 ||
+        !std::isfinite(pitchSemitones)) {
+        throwArgument(env, "Invalid tempo/pitch arguments");
+        return;
+    }
+    try {
+        const std::string input = jstringValue(env, inputPath);
+        const std::string output = jstringValue(env, outputPath);
+        FilterInput metadata;
+        try {
+            openFilterInput(input, metadata);
+            const std::string filter = buildSingleFilter(
+                    metadata, startMs, endMs, speed, pitchSemitones);
+            closeFilterInput(metadata);
+            transcodeFiltered({input}, output, filter);
+        } catch (...) {
+            closeFilterInput(metadata);
+            throw;
+        }
+    } catch (const std::exception &error) {
+        throwException(env, error.what());
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_bigjelly_temporun_player_FfmpegBridge_nativeConcat(
+        JNIEnv *env,
+        jobject,
+        jstring firstInputPath,
+        jstring secondInputPath,
+        jstring outputPath) {
+    if (firstInputPath == nullptr || secondInputPath == nullptr || outputPath == nullptr) {
+        throwArgument(env, "Invalid concat arguments");
+        return;
+    }
+    try {
+        const std::string filter =
+                "[in0]asetpts=PTS-STARTPTS[a0];"
+                "[in1]asetpts=PTS-STARTPTS[a1];"
+                "[a0][a1]concat=n=2:v=0:a=1,aresample=44100,"
+                "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[out]";
+        transcodeFiltered(
+                {jstringValue(env, firstInputPath), jstringValue(env, secondInputPath)},
+                jstringValue(env, outputPath),
+                filter);
     } catch (const std::exception &error) {
         throwException(env, error.what());
     }

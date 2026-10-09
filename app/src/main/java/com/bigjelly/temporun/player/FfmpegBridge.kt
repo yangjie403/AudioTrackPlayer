@@ -20,6 +20,30 @@ object FfmpegBridge {
         targetFormat: String,
     )
 
+    private external fun nativeWaveform(path: String, pointCount: Int): FloatArray
+
+    private external fun nativeTrim(
+        inputPath: String,
+        outputPath: String,
+        startMs: Long,
+        endMs: Long,
+    )
+
+    private external fun nativeTempoPitch(
+        inputPath: String,
+        outputPath: String,
+        startMs: Long,
+        endMs: Long,
+        speed: Double,
+        pitchSemitones: Double,
+    )
+
+    private external fun nativeConcat(
+        firstInputPath: String,
+        secondInputPath: String,
+        outputPath: String,
+    )
+
     fun version(): String = nativeVersion()
 
     fun configuration(): String = nativeConfiguration()
@@ -29,6 +53,38 @@ object FfmpegBridge {
         require(inputPath.isNotBlank()) { "inputPath must not be blank" }
         require(outputPath.isNotBlank()) { "outputPath must not be blank" }
         nativeConvert(inputPath, outputPath, targetFormat)
+    }
+
+    /** Returns normalized peak values suitable for rendering a compact waveform. */
+    fun waveform(path: String, pointCount: Int = 160): FloatArray {
+        require(path.isNotBlank()) { "path must not be blank" }
+        require(pointCount > 0) { "pointCount must be greater than zero" }
+        return nativeWaveform(path, pointCount)
+    }
+
+    /** Renders the selected interval to an MP3 file. */
+    fun trim(inputPath: String, outputPath: String, startMs: Long, endMs: Long) {
+        require(endMs > startMs) { "endMs must be greater than startMs" }
+        nativeTrim(inputPath, outputPath, startMs, endMs)
+    }
+
+    /** Renders a selected interval with independent speed and pitch controls. */
+    fun tempoPitch(
+        inputPath: String,
+        outputPath: String,
+        startMs: Long,
+        endMs: Long,
+        speed: Double,
+        pitchSemitones: Double,
+    ) {
+        require(endMs > startMs) { "endMs must be greater than startMs" }
+        require(speed > 0.0) { "speed must be greater than zero" }
+        nativeTempoPitch(inputPath, outputPath, startMs, endMs, speed, pitchSemitones)
+    }
+
+    /** Concatenates two audio files and writes a normalized MP3 output. */
+    fun concat(firstInputPath: String, secondInputPath: String, outputPath: String) {
+        nativeConcat(firstInputPath, secondInputPath, outputPath)
     }
 
     fun probe(path: String): FfmpegProbe {
