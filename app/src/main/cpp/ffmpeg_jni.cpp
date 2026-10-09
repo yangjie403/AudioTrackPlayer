@@ -13,6 +13,7 @@ extern "C" {
 #include "libavcodec/avcodec.h"
 #include "libavcodec/codec.h"
 #include "libavformat/avformat.h"
+#include "libavutil/audio_fifo.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/dict.h"
 #include "libavutil/error.h"
@@ -281,6 +282,250 @@ namespace {
         writeEncodedPackets(encoder, output, stream, packet);
     }
 
+    // 把一个解码器输出帧转换成编码器要求的格式，并追加到 FIFO。
+    //
+    // 这里不能直接调用 encodeFrame()，原因是解码器输出帧的 nb_samples
+    // 由输入编码格式决定，而编码器通常要求固定的 frame_size。例如：
+    //
+    //     MP3 解码帧       -> 1152 samples
+    //     FLAC 编码帧      -> 4096 samples
+    //     Opus 编码帧      -> 960 samples（48 kHz、20 ms）
+    //
+    // 解码帧和编码帧不是一一对应的关系。FIFO 的作用就是暂存这些已经
+    // 完成格式转换的 PCM 样本，等样本数达到编码器要求后再组装 AVFrame。
+    void resampleFrameToFifo(SwrContext *resampler,
+                             AVFrame *source,
+                             AVCodecContext *decoder,
+                             AVCodecContext *encoder,
+                             AVAudioFifo *fifo) {
+        // swr_get_delay() 是重采样器内部尚未输出的输入采样数。计算输出
+        // 容量时必须把这部分 delay 算进去，否则重采样器可能没有足够的
+        // 输出空间，尾部样本也可能无法在后续流程中取出。
+        const int outputCapacity = static_cast<int>(av_rescale_rnd(
+                swr_get_delay(resampler, decoder->sample_rate) + source->nb_samples,
+                encoder->sample_rate,
+                decoder->sample_rate,
+                AV_ROUND_UP));
+        if (outputCapacity <= 0) return;
+
+        // converted 只是本次 swr_convert() 的临时输出缓冲区。写入 FIFO
+        // 后即可释放，PCM 数据本身已经由 av_audio_fifo_write() 复制到 FIFO。
+        AVFrame *converted = av_frame_alloc();
+        if (converted == nullptr) {
+            throw std::runtime_error("无法分配重采样音频帧");
+        }
+
+        // 重采样器的输入参数来自 decoder，输出参数来自 encoder。这里的
+        // AVFrame 元数据必须和重采样器输出保持一致，否则 av_frame_get_buffer
+        // 或后续 FIFO/编码器操作可能无法正确解释音频数据。
+        converted->format = encoder->sample_fmt;
+        converted->sample_rate = encoder->sample_rate;
+        converted->nb_samples = outputCapacity;
+        int result = av_channel_layout_copy(&converted->ch_layout, &encoder->ch_layout);
+        if (result < 0) {
+            av_frame_free(&converted);
+            throw std::runtime_error("无法设置重采样后的声道布局: " + ffmpegError(result));
+        }
+
+        result = av_frame_get_buffer(converted, 0);
+        if (result < 0) {
+            av_frame_free(&converted);
+            throw std::runtime_error("无法分配重采样缓冲区: " + ffmpegError(result));
+        }
+
+        // samples 表示本次实际生成的“每个声道的采样数”，不是字节数。
+        // 对 planar 和 packed 采样格式，swr_convert() 会按照 format 填充
+        // converted->data 中的对应声道/交错数据。
+        const int samples = swr_convert(
+                resampler,
+                converted->data,
+                outputCapacity,
+                const_cast<const uint8_t **>(source->extended_data),
+                source->nb_samples);
+        if (samples < 0) {
+            av_frame_free(&converted);
+            throw std::runtime_error("音频重采样失败: " + ffmpegError(samples));
+        }
+
+        if (samples > 0) {
+            // AVAudioFifo 的容量单位同样是每个声道的 sample 数。它会根据
+            // sample_fmt 判断每个 sample 的字节数，并把 converted 中的数据
+            // 追加到 FIFO 尾部；这里不会因为本次只产生了一个“不完整编码帧”
+            // 就立即提交给编码器。
+            result = av_audio_fifo_write(
+                    fifo,
+                    reinterpret_cast<void **>(converted->data),
+                    samples);
+            if (result < samples) {
+                av_frame_free(&converted);
+                throw std::runtime_error("向音频 FIFO 写入数据失败");
+            }
+        }
+        av_frame_free(&converted);
+    }
+
+    // 输入解码结束后，SwrContext 内部可能仍缓存着重采样延迟样本。
+    // 这些样本不属于新的 decoder AVFrame，必须使用 swr_convert(..., nullptr, 0)
+    // 主动取出，并继续追加到 FIFO，否则输出文件末尾会缺少音频数据。
+    void drainResamplerIntoFifo(SwrContext *resampler,
+                                AVCodecContext *decoder,
+                                AVCodecContext *encoder,
+                                AVAudioFifo *fifo) {
+        while (true) {
+            const int64_t delay = swr_get_delay(resampler, decoder->sample_rate);
+            // delay 归零表示重采样器已经完全排空。此时才可以进入 FIFO
+            // 尾帧处理和编码器 flush 阶段。
+            if (delay <= 0) return;
+
+            const int capacity = static_cast<int>(av_rescale_rnd(
+                    delay,
+                    encoder->sample_rate,
+                    decoder->sample_rate,
+                    AV_ROUND_UP));
+            if (capacity <= 0) return;
+
+            AVFrame *tail = av_frame_alloc();
+            if (tail == nullptr) {
+                throw std::runtime_error("无法分配重采样尾帧");
+            }
+            tail->format = encoder->sample_fmt;
+            tail->sample_rate = encoder->sample_rate;
+            tail->nb_samples = capacity;
+
+            int result = av_channel_layout_copy(&tail->ch_layout, &encoder->ch_layout);
+            if (result >= 0) result = av_frame_get_buffer(tail, 0);
+            if (result < 0) {
+                av_frame_free(&tail);
+                throw std::runtime_error("无法分配重采样尾帧缓冲区: " + ffmpegError(result));
+            }
+
+            // 输入指针为 nullptr、输入样本数为 0，表示“只读取重采样器
+            // 内部缓存，不再提供新的输入样本”。一次调用可能仍无法取尽
+            // 所有 delay，因此外层 while 会继续排空。
+            const int samples = swr_convert(resampler, tail->data, capacity, nullptr, 0);
+            if (samples < 0) {
+                av_frame_free(&tail);
+                throw std::runtime_error("排空重采样器失败: " + ffmpegError(samples));
+            }
+            if (samples == 0) {
+                av_frame_free(&tail);
+                return;
+            }
+
+            // 排出的样本和普通解码帧产生的样本一样，都必须先进入 FIFO；
+            // 后续统一由 encodeAvailableFifo() 按 frame_size 组帧。
+            result = av_audio_fifo_write(
+                    fifo,
+                    reinterpret_cast<void **>(tail->data),
+                    samples);
+            av_frame_free(&tail);
+            if (result < samples) {
+                throw std::runtime_error("向音频 FIFO 写入尾部数据失败");
+            }
+        }
+    }
+
+    // 尽可能从 FIFO 中取出编码帧并提交给编码器。
+    //
+    // 调用时机有两种：
+    // 1. finalDrain == false：正在解码，只有 FIFO 中已经有完整帧时才编码，
+    //    不足一个 frame_size 的样本留在 FIFO，等待下一个解码帧补齐。
+    // 2. finalDrain == true：decoder 和 SwrContext 都已结束，FIFO 中的剩余
+    //    样本必须全部处理；尾部不足一个完整帧时，根据编码器能力发送小帧
+    //    或补静音到完整帧。
+    void encodeAvailableFifo(AVAudioFifo *fifo,
+                             AVCodecContext *encoder,
+                             AVFormatContext *output,
+                             AVStream *stream,
+                             AVPacket *packet,
+                             int64_t *nextPts,
+                             bool finalDrain) {
+        // VARIABLE_FRAME_SIZE 表示编码器允许每次接收不同的 nb_samples。
+        // 没有这个能力时，普通帧必须严格使用 encoder->frame_size。
+        const bool variableFrameSize =
+                (encoder->codec->capabilities & AV_CODEC_CAP_VARIABLE_FRAME_SIZE) != 0;
+
+        // SMALL_LAST_FRAME 表示编码器允许最后一帧小于固定 frame_size。
+        // FLAC 通常支持该能力；不支持时，尾部必须补静音后再送入编码器。
+        const bool smallLastFrame =
+                (encoder->codec->capabilities & AV_CODEC_CAP_SMALL_LAST_FRAME) != 0;
+
+        while (true) {
+            // available 是 FIFO 中当前已有的每声道样本数，而不是字节数。
+            const int available = av_audio_fifo_size(fifo);
+            if (available <= 0) return;
+
+            // 转码尚未结束时不能对不完整的 FIFO 数据补静音，因为后面还会
+            // 有新的真实音频样本到来。此时直接返回，保留 FIFO 中的样本。
+            if (!finalDrain && !variableFrameSize && available < encoder->frame_size) return;
+
+            const int nominalFrameSize = encoder->frame_size > 0 ? encoder->frame_size : available;
+            int frameSamples;
+            if (variableFrameSize) {
+                // 可变帧编码器可以直接使用当前可用样本；如果配置了一个
+                // 正数 frame_size，则按该大小分批，避免一次积累过多数据。
+                frameSamples = std::min(available, nominalFrameSize);
+            } else if (finalDrain && available < nominalFrameSize && smallLastFrame) {
+                // 允许小尾帧的编码器可以直接消费 FIFO 剩余的真实样本。
+                frameSamples = available;
+            } else {
+                // 固定帧编码器的普通帧和不支持小尾帧的最后一帧，都必须
+                // 分配完整 frame_size 的 AVFrame。尾部缺少的部分稍后补静音。
+                frameSamples = nominalFrameSize;
+            }
+            if (frameSamples <= 0) return;
+
+            AVFrame *frame = av_frame_alloc();
+            if (frame == nullptr) throw std::runtime_error("无法分配编码音频帧");
+            // 组装出的 AVFrame 必须完整描述编码器要接收的数据：采样格式、
+            // 采样率、声道布局、每声道样本数以及时间戳。
+            frame->format = encoder->sample_fmt;
+            frame->sample_rate = encoder->sample_rate;
+            frame->nb_samples = frameSamples;
+            frame->pts = *nextPts;
+
+            int result = av_channel_layout_copy(&frame->ch_layout, &encoder->ch_layout);
+            if (result >= 0) result = av_frame_get_buffer(frame, 0);
+            if (result < 0) {
+                av_frame_free(&frame);
+                throw std::runtime_error("无法分配编码帧缓冲区: " + ffmpegError(result));
+            }
+
+            // 只从 FIFO 读取真实存在的样本。对于需要补齐的尾帧，读取数会
+            // 小于 frameSamples，剩余空间仍然保留在刚分配的 frame 中。
+            const int samplesToRead = std::min(av_audio_fifo_size(fifo), frameSamples);
+            result = av_audio_fifo_read(
+                    fifo,
+                    reinterpret_cast<void **>(frame->data),
+                    samplesToRead);
+            if (result < samplesToRead) {
+                av_frame_free(&frame);
+                throw std::runtime_error("从音频 FIFO 读取数据失败");
+            }
+
+            if (samplesToRead < frameSamples) {
+                // 补静音只发生在最终尾帧。这样既满足固定帧大小要求，又不会
+                // 把补出的静音计入 nextPts，避免输出时间戳比真实音频更长。
+                av_samples_set_silence(
+                        frame->data,
+                        samplesToRead,
+                        frameSamples - samplesToRead,
+                        encoder->ch_layout.nb_channels,
+                        encoder->sample_fmt);
+            } else if (smallLastFrame && finalDrain) {
+                // 对允许小尾帧的编码器，frameSamples 等于真实剩余样本数；
+                // 明确设置 nb_samples，表达“这是一个没有补静音的小尾帧”。
+                frame->nb_samples = samplesToRead;
+            }
+
+            // 编码器 time_base 为 {1, sample_rate}，所以 nextPts 的单位是
+            // 每声道采样点。这里只推进真实读取的样本数，不推进补的静音数。
+            *nextPts += samplesToRead;
+            encodeFrame(encoder, output, stream, frame, packet);
+            av_frame_free(&frame);
+        }
+    }
+
     void transcodeFile(const std::string &inputPath,
                        const std::string &outputPath,
                        const std::string &targetFormat) {
@@ -299,9 +544,9 @@ namespace {
         AVFormatContext *output = nullptr;
         AVCodecContext *encoder = nullptr;
         SwrContext *resampler = nullptr;
+        AVAudioFifo *fifo = nullptr;
         AVPacket *packet = nullptr;
         AVFrame *decoded = nullptr;
-        AVFrame *converted = nullptr;
         bool headerWritten = false;
 
         try {
@@ -398,45 +643,33 @@ namespace {
             if (result < 0)
                 throw std::runtime_error("无法初始化音频重采样器: " + ffmpegError(result));
 
+            // FIFO 初始容量以“每声道 sample 数”为单位，不是字节数。容量
+            // 不够时 av_audio_fifo_write() 会自动扩容；这里使用至少 1024
+            // samples，减少 MP3 解码帧较小时的频繁扩容。
+            const int fifoInitialSize = std::max(encoder->frame_size, 1024);
+            fifo = av_audio_fifo_alloc(
+                    encoder->sample_fmt,
+                    encoder->ch_layout.nb_channels,
+                    fifoInitialSize);
+            if (fifo == nullptr) throw std::runtime_error("无法创建音频 FIFO");
+
             packet = av_packet_alloc();
             decoded = av_frame_alloc();
-            converted = av_frame_alloc();
-            if (packet == nullptr || decoded == nullptr || converted == nullptr)
+            if (packet == nullptr || decoded == nullptr)
                 throw std::runtime_error("无法分配音频处理缓冲区");
 
             int64_t nextPts = 0;
             auto convertAndEncode = [&](AVFrame *source) {
-                // 为每个解码帧准备目标格式的 AVFrame。nb_samples 需要把
-                // 重采样器内部尚未输出的 delay 一并计算，避免丢失尾部样本。
-                av_frame_unref(converted);
-                converted->format = encoder->sample_fmt;
-                converted->sample_rate = encoder->sample_rate;
-                result = av_channel_layout_copy(&converted->ch_layout, &encoder->ch_layout);
-                if (result < 0)
-                    throw std::runtime_error("无法设置转换后的声道布局: " + ffmpegError(result));
-                const int outputSamples = static_cast<int>(av_rescale_rnd(
-                        swr_get_delay(resampler, decoder->sample_rate) + source->nb_samples,
-                        encoder->sample_rate,
-                        decoder->sample_rate,
-                        AV_ROUND_UP));
-                converted->nb_samples = outputSamples;
-                result = av_frame_get_buffer(converted, 0);
-                if (result < 0)
-                    throw std::runtime_error("无法分配转换后的音频帧: " + ffmpegError(result));
-                const int samples = swr_convert(
-                        resampler,
-                        converted->data,
-                        outputSamples,
-                        const_cast<const uint8_t **>(source->extended_data),
-                        source->nb_samples);
-                if (samples < 0)
-                    throw std::runtime_error("音频重采样失败: " + ffmpegError(samples));
-                converted->nb_samples = samples;
-                // 编码器时间基为 1/sample_rate，因此 PTS 的单位就是
-                // “编码采样点”。nextPts 按实际输出的采样数单调递增。
-                converted->pts = nextPts;
-                nextPts += samples;
-                if (samples > 0) encodeFrame(encoder, output, outputStream, converted, packet);
+                // 每得到一个 decoder AVFrame，就执行两步：
+                //
+                //   decoder frame -> swr_convert -> FIFO
+                //   FIFO 中的完整样本 -> encoder frame -> encoder
+                //
+                // encodeAvailableFifo(false) 只会取走完整编码帧，剩余样本
+                // 会继续留在 FIFO 中，直到下一个解码帧到来。
+                resampleFrameToFifo(resampler, source, decoder, encoder, fifo);
+                encodeAvailableFifo(
+                        fifo, encoder, output, outputStream, packet, &nextPts, false);
             };
 
             // ---------- 主循环：读取压缩包、解码、重采样并编码 ----------
@@ -474,6 +707,19 @@ namespace {
             if (result != AVERROR(EAGAIN) && result != AVERROR_EOF)
                 throw std::runtime_error("刷新解码器失败: " + ffmpegError(result));
 
+            // 结束阶段的顺序不能颠倒：
+            //
+            //   1. decoder flush：取出解码器内部缓存的最后 AVFrame；
+            //   2. swr flush：把重采样器内部 delay 排入 FIFO；
+            //   3. FIFO drain：编码 FIFO 中的完整帧和最后尾帧；
+            //   4. encoder flush：取出编码器内部缓存的最后 AVPacket；
+            //   5. write trailer：完成容器索引和尾部元数据。
+            //
+            // 如果提前 flush encoder，FIFO 中尚未编码的样本就会被遗漏。
+            drainResamplerIntoFifo(resampler, decoder, encoder, fifo);
+            encodeAvailableFifo(
+                    fifo, encoder, output, outputStream, packet, &nextPts, true);
+
             // ---------- flush 编码器并完成封装 ----------
             // 编码器也可能缓存输入帧。发送 nullptr 后继续取包，确保最后
             // 一个编码包被写入；随后写入容器尾部索引和元数据。
@@ -487,9 +733,9 @@ namespace {
                     throw std::runtime_error("无法写入输出文件尾: " + ffmpegError(result));
             }
         } catch (...) {
-            av_frame_free(&converted);
             av_frame_free(&decoded);
             av_packet_free(&packet);
+            av_audio_fifo_free(fifo);
             swr_free(&resampler);
             avcodec_free_context(&encoder);
             if (output != nullptr && output->pb != nullptr &&
@@ -502,9 +748,9 @@ namespace {
             throw;
         }
 
-        av_frame_free(&converted);
         av_frame_free(&decoded);
         av_packet_free(&packet);
+        av_audio_fifo_free(fifo);
         swr_free(&resampler);
         avcodec_free_context(&encoder);
         if (output != nullptr && output->pb != nullptr &&

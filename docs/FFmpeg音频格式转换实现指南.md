@@ -5,7 +5,7 @@
 - Android SAF 文件选择与临时文件；
 - Kotlin/JNI/C++ 调用链；
 - FFmpeg 解复用、解码、重采样、FIFO、编码和封装；
-- MP3 转 FLAC 报“提交编码帧失败”的原因；
+- MP3 转 FLAC、OGG、Opus 报“提交编码帧失败”的原因；
 - 可复现的关键实现代码；
 - 时间戳、刷新、资源释放、元数据和测试方法。
 
@@ -47,6 +47,7 @@ MP3 文件
 2. 解码器输出帧的大小不一定等于编码器要求的帧大小。
 3. FLAC 是无损编码，但不能恢复 MP3 已经丢失的音频信息。
 4. 转换时既要处理编码器，也要处理容器和时间戳。
+5. `AVAudioFifo` 不是额外的编码格式转换器，而是位于 `SwrContext` 和编码器之间的 PCM 采样缓存与重新分帧器。
 
 ## 2. 当前项目的整体架构
 
@@ -600,7 +601,7 @@ if (result < 0) {
 
 输入参数来自 decoder，输出参数来自 encoder，顺序不能写反。
 
-## 9. MP3 转 FLAC 失败的根本原因
+## 9. MP3 转 FLAC、OGG、Opus 失败的根本原因
 
 ### 9.1 解码帧和编码帧大小不同
 
@@ -654,6 +655,42 @@ FIFO：3456 samples
 ```
 
 解码帧和编码帧不能直接一一对应。
+
+### 9.3 为什么 OGG 和 Opus 也需要同样的处理
+
+FIFO 不是只为 FLAC 准备的特殊分支，而是所有“解码帧大小”和“编码器输入帧大小”可能不同的目标格式都需要的通用层。当前项目的目标编码器分别是：
+
+| 目标格式 | 编码器 | FIFO 的作用 |
+| --- | --- | --- |
+| FLAC | `flac` | 将解码后的 PCM 组织成 FLAC 能接受的固定或允许的小尾帧 |
+| OGG | `libvorbis` | 将解码后的 PCM 组织成 Vorbis 编码器要求的输入帧 |
+| Opus | `libopus` | 将重采样到 48 kHz 后的 PCM 按 Opus 的编码帧要求组装 |
+
+不能根据文件扩展名推断“这一种格式可以直接接收任意 `nb_samples`”。编码器打开后，实际应读取：
+
+```cpp
+encoder->frame_size
+encoder->codec->capabilities
+```
+
+然后按以下规则处理：
+
+1. 普通阶段只从 FIFO 取出完整的 `encoder->frame_size`；
+2. 具有 `AV_CODEC_CAP_VARIABLE_FRAME_SIZE` 的编码器可以使用可变大小的帧；
+3. 输入结束时，具有 `AV_CODEC_CAP_SMALL_LAST_FRAME` 的编码器可以接收剩余小帧；
+4. 不支持小尾帧时，将尾部真实样本读出后补静音到完整 `frame_size`；
+5. 只有真实从 FIFO 读取的样本才推进 `nextPts`，补出的静音不计入 PTS。
+
+因此，修复后的数据流对三种目标格式都是一致的：
+
+```text
+MP3 AVFrame
+  -> swr_convert（格式、采样率、声道布局转换）
+  -> av_audio_fifo_write（追加每声道 samples）
+  -> av_audio_fifo_size（判断是否达到编码帧大小）
+  -> av_audio_fifo_read（取出一帧 PCM）
+  -> avcodec_send_frame（提交符合要求的 AVFrame）
+```
 
 ## 10. AVAudioFifo 的正确实现
 
@@ -784,27 +821,24 @@ void encodeAvailableFifo(
             return;
         }
 
+        const int nominalFrameSize = encoder->frame_size > 0
+                ? encoder->frame_size
+                : available;
         int frameSamples = 0;
 
         if (variableFrameSize) {
-            frameSamples = finalDrain
-                    ? available
-                    : std::min(
-                            available,
-                            encoder->frame_size > 0
-                                ? encoder->frame_size
-                                : available);
+            // 当前实现即使面对可变帧编码器，也按 nominalFrameSize 分批，
+            // 避免一次从 FIFO 取出过大的音频帧。
+            frameSamples = std::min(available, nominalFrameSize);
         } else if (finalDrain &&
-                   available < encoder->frame_size &&
+                   available < nominalFrameSize &&
                    !smallLastFrame) {
             // 不支持小尾帧的编码器需要补齐。
-            frameSamples = encoder->frame_size;
+            frameSamples = nominalFrameSize;
         } else {
             frameSamples = finalDrain
-                    ? std::min(
-                            available,
-                            encoder->frame_size)
-                    : encoder->frame_size;
+                    ? std::min(available, nominalFrameSize)
+                    : nominalFrameSize;
         }
 
         if (frameSamples <= 0) {
@@ -864,13 +898,14 @@ void encodeAvailableFifo(
                     frameSamples - samplesToRead,
                     encoder->ch_layout.nb_channels,
                     encoder->sample_fmt);
-        } else {
+        } else if (smallLastFrame && finalDrain) {
+            // 允许小尾帧的编码器只接收真实剩余样本。
             frame->nb_samples = samplesToRead;
         }
 
         *nextPts += samplesToRead;
 
-        sendFrameAndWritePackets(
+        encodeFrame(
                 encoder,
                 output,
                 stream,
@@ -938,7 +973,7 @@ EAGAIN 表示当前没有更多输出，不是编码失败。真正的负错误�
 ### 11.2 发送一帧并写包
 
 ```cpp
-void sendFrameAndWritePackets(
+void encodeFrame(
         AVCodecContext *encoder,
         AVFormatContext *output,
         AVStream *stream,
@@ -1716,4 +1751,3 @@ avcodec_send_packet(decoder, nullptr)
 11. Android content URI 先复制成临时文件，native 层只处理普通路径。
 12. 转换放在后台线程，JNI 异常转换为 Java 异常。
 13. FLAC 无法恢复 MP3 已经损失的音频信息。
-

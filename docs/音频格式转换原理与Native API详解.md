@@ -219,12 +219,16 @@ avcodec_receive_packet()
 av_interleaved_write_frame()
 
 avcodec_send_packet(decoder, nullptr)
+  -> 取出 decoder 剩余 AVFrame
 swr_convert(..., nullptr, 0)
+  -> av_audio_fifo_write()
+av_audio_fifo_read()
+  -> 处理 FIFO 尾帧
 avcodec_send_frame(encoder, nullptr)
 av_write_trailer()
 ```
 
-说明：上面展示的是本文要实现的完整正确流水线。当前仓库中的 `ffmpeg_jni.cpp` 仍保留直接把重采样帧送入编码器的旧路径；因此，遇到固定帧大小编码器时，应按照第 11 节接入 FIFO 后再运行完整流程。
+说明：当前仓库的 `ffmpeg_jni.cpp` 已在 decoder 和 encoder 之间接入 `AVAudioFifo`。每个解码帧先经过 `swr_convert()` 并写入 FIFO，只有 FIFO 中达到编码器要求的样本数后才创建编码帧；输入结束时还要排空 `SwrContext`，再处理 FIFO 尾部，最后才能 flush encoder。
 
 ---
 
@@ -1650,7 +1654,7 @@ if (samples < 0) {
 
 `AVAudioFifo` 是按“每个声道的采样数”工作的音频 FIFO，不是普通的字节 FIFO。它位于解码器/重采样器和编码器之间，负责解决输入帧大小与编码器固定帧大小不同的问题。
 
-> 实现状态说明：当前仓库中的 `app/src/main/cpp/ffmpeg_jni.cpp` 仍是“重采样后直接调用 `avcodec_send_frame()`”的旧实现，并没有真正创建 `AVAudioFifo`。因此，本节的 FIFO 代码是复现 MP3→FLAC 等固定帧编码转换时应采用的修正版参考实现；如果只按当前源码运行，仍可能出现“提交编码帧失败: Invalid argument”。
+当前仓库中的 `app/src/main/cpp/ffmpeg_jni.cpp` 已采用本节的 FIFO 方案。`AVAudioFifo` 只缓存已经完成格式转换的 PCM 样本，不负责解码、重采样或编码；它的核心职责是把任意大小的输入片段重新组织为编码器能够接受的 `AVFrame`。
 
 ### 11.1 为什么需要 FIFO
 
@@ -1679,6 +1683,31 @@ FIFO 将输入端任意大小的解码帧重新组织为编码器要求的帧：
 FIFO >= 4096
 取出 4096 -> FLAC encoder
 ```
+
+### 11.1.1 FLAC、OGG 和 Opus 的统一处理方式
+
+FIFO 不是 FLAC 专用组件。只要解码器输出的 `nb_samples` 可能与目标编码器要求的输入帧大小不同，就应该使用相同的 FIFO 方案：
+
+| 目标格式 | 编码器 | FIFO 需要解决的问题 |
+| --- | --- | --- |
+| FLAC | `flac` | 将 MP3 等输入产生的 PCM 组织成 FLAC 可接受的固定帧或小尾帧 |
+| OGG | `libvorbis` | 将 PCM 组织成 Vorbis 编码器需要的输入帧，并封装到 Ogg 容器 |
+| Opus | `libopus` | 先按编码器要求重采样，当前项目固定使用 48 kHz，再按 Opus 帧大小组帧 |
+
+因此不能根据扩展名决定是否需要 FIFO，而应在编码器打开后读取：
+
+```cpp
+encoder->frame_size
+encoder->codec->capabilities
+```
+
+当前实现的组帧规则是：
+
+1. 转码进行中，固定帧编码器只有在 FIFO 样本数达到 `encoder->frame_size` 时才提交编码帧；
+2. 支持 `AV_CODEC_CAP_VARIABLE_FRAME_SIZE` 时，可以使用可变帧大小，但当前代码仍按 `nominalFrameSize` 分批读取；
+3. 输入结束后，支持 `AV_CODEC_CAP_SMALL_LAST_FRAME` 时直接提交 FIFO 中的剩余小帧；
+4. 不支持小尾帧时，读取真实样本后用 `av_samples_set_silence()` 补齐；
+5. 补出的静音不计入 `nextPts`，避免输出时间戳表示的真实音频时长被无意义地延长。
 
 ### 11.2 创建 FIFO
 
@@ -1906,26 +1935,23 @@ void encodeAvailableFifo(
             return;
         }
     
+        const int nominalFrameSize = encoder->frame_size > 0
+                ? encoder->frame_size
+                : available;
         int frameSamples = 0;
     
         if (variableFrameSize) {
-            frameSamples = finalDrain
-                    ? available
-                    : std::min(
-                            available,
-                            encoder->frame_size > 0
-                                ? encoder->frame_size
-                                : available);
+            // 当前实现即使面对可变帧编码器，也按 nominalFrameSize 分批，
+            // 避免一次从 FIFO 取出过大的音频帧。
+            frameSamples = std::min(available, nominalFrameSize);
         } else if (finalDrain &&
-                   available < encoder->frame_size &&
+                   available < nominalFrameSize &&
                    !smallLastFrame) {
-            frameSamples = encoder->frame_size;
+            frameSamples = nominalFrameSize;
         } else {
             frameSamples = finalDrain
-                    ? std::min(
-                            available,
-                            encoder->frame_size)
-                    : encoder->frame_size;
+                    ? std::min(available, nominalFrameSize)
+                    : nominalFrameSize;
         }
     
         if (frameSamples <= 0) {
@@ -1984,13 +2010,14 @@ void encodeAvailableFifo(
                     frameSamples - samplesToRead,
                     encoder->ch_layout.nb_channels,
                     encoder->sample_fmt);
-        } else {
+        } else if (smallLastFrame && finalDrain) {
+            // 允许小尾帧的编码器只接收真实剩余样本。
             frame->nb_samples = samplesToRead;
         }
     
         *nextPts += samplesToRead;
     
-        sendFrameAndWritePackets(
+        encodeFrame(
                 encoder,
                 output,
                 stream,
@@ -2026,6 +2053,41 @@ void av_audio_fifo_free(AVAudioFifo *af);
 ## 12. 解码、编码和 flush
 
 本节展示 FFmpeg send/receive API 的状态机。一次 `send` 不一定立即对应一次 `receive`，因此解码和编码都必须循环读取输出。
+
+### 12.0 FIFO 在主循环中的位置
+
+当前 native 主循环对每个解码帧执行以下两步：
+
+```cpp
+// 生产阶段：把解码帧转换成编码器格式，并追加到 FIFO。
+resampleFrameToFifo(
+        resampler,
+        decoded,
+        decoder,
+        encoder,
+        fifo);
+
+// 消费阶段：尽可能取出完整编码帧；不足一帧的样本继续留在 FIFO。
+encodeAvailableFifo(
+        fifo,
+        encoder,
+        output,
+        outputStream,
+        packet,
+        &nextPts,
+        false);
+```
+
+`finalDrain == false` 表示输入还没有结束。对于不支持可变帧大小的编码器，如果 FIFO 中的样本少于 `encoder->frame_size`，`encodeAvailableFifo()` 会直接返回，不会补静音，也不会丢弃这些样本；下一次解码帧到来后，新的 PCM 会继续追加到 FIFO。
+
+这两个函数的职责边界如下：
+
+| 阶段 | 函数 | 负责内容 |
+| --- | --- | --- |
+| 生产 PCM | `resampleFrameToFifo()` | 计算重采样输出容量、调用 `swr_convert()`、把结果写入 FIFO |
+| 组织编码帧 | `encodeAvailableFifo()` | 查询 FIFO 大小、按 `frame_size` 读取、设置 AVFrame 元数据和 PTS |
+| 编码输出 | `encodeFrame()` | 调用 `avcodec_send_frame()` 并循环接收/写入编码包 |
+| 结束处理 | `drainResamplerIntoFifo()` + `encodeAvailableFifo(..., true)` | 排空重采样器、处理 FIFO 尾部、必要时补静音 |
 
 ### 12.1 读取并解码压缩包
 
@@ -2848,7 +2910,7 @@ int av_strerror(
 
 ---
 
-## 15. MP3 转 FLAC 错误详解
+## 15. MP3 转 FLAC、OGG、Opus 错误详解
 
 项目出现过：
 
@@ -2909,7 +2971,7 @@ FIFO 累计到 4096
 
 ### 15.3 编码器能力标志
 
-如果编码器具有 AV_CODEC_CAP_VARIABLE_FRAME_SIZE，可以接受不同数量的样本。
+如果编码器具有 `AV_CODEC_CAP_VARIABLE_FRAME_SIZE`，可以接受不同数量的样本；当前实现仍使用 `nominalFrameSize` 分批从 FIFO 取数据，避免一次创建过大的 AVFrame。
 
 如果没有该能力，普通帧必须满足：
 
@@ -2925,7 +2987,7 @@ frame->nb_samples == encoder->frame_size
 
 | 标志 | 含义 | 对 FIFO/flush 的影响 |
 | --- | --- | --- |
-| `AV_CODEC_CAP_VARIABLE_FRAME_SIZE` | 编码器允许每帧使用不同数量的样本 | `frame_size` 可能为 0，可以按 FIFO 当前可用样本数组帧 |
+| `AV_CODEC_CAP_VARIABLE_FRAME_SIZE` | 编码器允许每帧使用不同数量的样本 | `frame_size` 可能为 0，当前实现按 `nominalFrameSize` 分批组帧 |
 | `AV_CODEC_CAP_SMALL_LAST_FRAME` | 编码器允许最后一帧小于固定 `frame_size` | drain 时可以直接提交尾部小帧，不必补静音 |
 | `AV_CODEC_CAP_DELAY` | 编解码器内部可能缓存数据 | 输入结束必须 flush，继续 receive 直到 `EAGAIN/EOF` |
 | `AV_CODEC_CAP_EXPERIMENTAL` | 编解码器被标记为实验性 | 必要时设置 `strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL` |
@@ -3175,8 +3237,11 @@ SwrContext *resampler
 AVAudioFifo *fifo
 AVPacket *packet
 AVFrame *decoded
-AVFrame *converted
 ```
+
+`converted` 和 `tail` 是 `resampleFrameToFifo()`、`drainResamplerIntoFifo()`
+内部的临时帧，函数返回前就会释放；FIFO 已经复制并持有写入的 PCM 数据，
+因此它们不需要作为 `transcodeFile()` 的长期资源保存。
 
 推荐释放顺序：
 
