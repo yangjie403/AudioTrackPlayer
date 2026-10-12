@@ -12,6 +12,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 extern "C" {
@@ -918,6 +919,38 @@ namespace {
         return filters.str();
     }
 
+    // 将多个保留区间在同一条滤镜图中裁剪并拼接，最终只编码一次 MP3。
+    std::string buildKeepSegmentsFilter(const std::vector<std::pair<int64_t, int64_t>> &segments) {
+        if (segments.empty()) throw std::runtime_error("没有可保留的音频分段");
+        std::ostringstream filters;
+        if (segments.size() == 1) {
+            filters << "[in0]atrim=start=" << std::fixed << std::setprecision(6)
+                    << static_cast<double>(segments[0].first) / 1000.0
+                    << ":end=" << static_cast<double>(segments[0].second) / 1000.0
+                    << ",asetpts=PTS-STARTPTS," << fixedAudioFormat() << "[out]";
+            return filters.str();
+        }
+
+        filters << "[in0]asplit=" << segments.size();
+        for (size_t index = 0; index < segments.size(); ++index) {
+            filters << "[split" << index << "]";
+        }
+        filters << ";";
+        for (size_t index = 0; index < segments.size(); ++index) {
+            filters << "[split" << index << "]atrim=start=" << std::fixed
+                    << std::setprecision(6)
+                    << static_cast<double>(segments[index].first) / 1000.0
+                    << ":end=" << static_cast<double>(segments[index].second) / 1000.0
+                    << ",asetpts=PTS-STARTPTS[part" << index << "];";
+        }
+        for (size_t index = 0; index < segments.size(); ++index) {
+            filters << "[part" << index << "]";
+        }
+        filters << "concat=n=" << segments.size()
+                << ":v=0:a=1," << fixedAudioFormat() << "[out]";
+        return filters.str();
+    }
+
     // 创建 abuffer/abuffersink，并限制 sink 输出为 fltp、44100 Hz、stereo。
     void configureFilterSources(AVFilterGraph *graph,
                                 std::vector<FilterInput> &inputs,
@@ -1492,6 +1525,65 @@ Java_com_bigjelly_temporun_player_FfmpegBridge_nativeTempoPitch(
             }
             const std::string filter = buildSingleFilter(
                     metadata, startMs, endMs, speed, pitchSemitones);
+            closeFilterInput(metadata);
+            transcodeFiltered({input}, output, filter);
+        } catch (...) {
+            closeFilterInput(metadata);
+            throw;
+        }
+    } catch (const std::exception &error) {
+        throwException(env, error.what());
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_bigjelly_temporun_player_FfmpegBridge_nativeKeepSegments(
+        JNIEnv *env,
+        jobject,
+        jstring inputPath,
+        jstring outputPath,
+        jlongArray boundariesMs) {
+    if (inputPath == nullptr || outputPath == nullptr || boundariesMs == nullptr) {
+        throwArgument(env, "Invalid segment arguments");
+        return;
+    }
+    const jsize length = env->GetArrayLength(boundariesMs);
+    if (length <= 0 || length % 2 != 0) {
+        throwArgument(env, "Segment boundaries must contain start/end pairs");
+        return;
+    }
+    std::vector<jlong> values(static_cast<size_t>(length));
+    env->GetLongArrayRegion(boundariesMs, 0, length, values.data());
+    std::vector<std::pair<int64_t, int64_t>> segments;
+    segments.reserve(values.size() / 2);
+    for (size_t index = 0; index < values.size(); index += 2) {
+        if (values[index] < 0 || values[index + 1] <= values[index]) {
+            throwArgument(env, "Invalid audio segment range");
+            return;
+        }
+        segments.emplace_back(values[index], values[index + 1]);
+    }
+    try {
+        const std::string input = jstringValue(env, inputPath);
+        const std::string output = jstringValue(env, outputPath);
+        FilterInput metadata;
+        try {
+            openFilterInput(input, metadata);
+            const int64_t durationMs = filterInputDurationMs(metadata);
+            if (segments.size() == 1 && canCopyWholeMp3(
+                    metadata, segments[0].first, segments[0].second)) {
+                copyBinaryFile(input, output);
+                closeFilterInput(metadata);
+                return;
+            }
+            if (durationMs > 0) {
+                for (const auto &segment : segments) {
+                    if (segment.first >= durationMs) {
+                        throw std::runtime_error("音频分段起点超出时长");
+                    }
+                }
+            }
+            const std::string filter = buildKeepSegmentsFilter(segments);
             closeFilterInput(metadata);
             transcodeFiltered({input}, output, filter);
         } catch (...) {

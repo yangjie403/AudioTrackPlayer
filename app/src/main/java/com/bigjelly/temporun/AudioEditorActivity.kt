@@ -1,7 +1,5 @@
 package com.bigjelly.temporun
 
-import android.app.Activity
-import android.content.Intent
 import android.database.Cursor
 import android.net.Uri
 import android.os.Bundle
@@ -12,13 +10,12 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -56,9 +53,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.bigjelly.temporun.player.AdvancedAudioPlayer
@@ -67,7 +62,6 @@ import java.io.File
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
@@ -83,7 +77,7 @@ class AudioEditorActivity : ComponentActivity() {
     private enum class ImportTarget { FIRST, SECOND }
 
     /** 标记待导出的 native 操作类型。 */
-    private enum class ExportKind { TRIM, CONCAT }
+    private enum class ExportKind { SEGMENTS, CONCAT }
 
     /** 页面状态中保存的一段音频；file 是 native 层实际读取的缓存文件。 */
     data class Track(
@@ -93,13 +87,18 @@ class AudioEditorActivity : ComponentActivity() {
         val waveform: List<Float>,
     )
 
+    /** 主音轨中一个保留的音频分段。 */
+    data class AudioSegment(
+        val startMs: Long,
+        val endMs: Long,
+    )
+
     /** SAF 返回保存位置之前暂存的导出请求。 */
     private data class ExportRequest(
         val kind: ExportKind,
         val first: File,
         val second: File? = null,
-        val startMs: Long = 0L,
-        val endMs: Long = 0L,
+        val segments: List<AudioSegment> = emptyList(),
         val outputName: String,
     )
 
@@ -154,7 +153,7 @@ class AudioEditorActivity : ComponentActivity() {
                         openAudio.launch(arrayOf("audio/*"))
                     },
                     onPreview = ::previewSelection,
-                    onExportTrim = ::requestTrimExport,
+                    onExportSegments = ::requestSegmentsExport,
                     onExportConcat = ::requestConcatExport,
                     onStop = {
                         player.stop()
@@ -192,7 +191,7 @@ class AudioEditorActivity : ComponentActivity() {
                 firstTempFile = file
                 firstTrackState.value = track
                 busyState.value = false
-                statusState.value = "拖动波形两侧把手选择区间"
+                statusState.value = "左右滑动波形调整进度，在当前进度分割音频"
             } catch (error: Throwable) {
                 busyState.value = false
                 statusState.value = "示例音频加载失败：${error.message ?: "未知错误"}"
@@ -276,17 +275,17 @@ class AudioEditorActivity : ComponentActivity() {
         }
     }
 
-    private fun requestTrimExport(startMs: Long, endMs: Long) {
+    private fun requestSegmentsExport(segments: List<AudioSegment>) {
         val track = firstTrackState.value ?: return
+        if (segments.isEmpty()) return
         // 先记录参数并打开系统保存器；用户确认路径后才开始执行 native 导出。
         pendingExport = ExportRequest(
-            kind = ExportKind.TRIM,
+            kind = ExportKind.SEGMENTS,
             first = track.file,
-            startMs = startMs,
-            endMs = endMs,
-            outputName = "${track.name.substringBeforeLast('.', "clip")}-clip.mp3",
+            segments = segments,
+            outputName = "${track.name.substringBeforeLast('.', "audio")}-edited.mp3",
         )
-        createOutput.launch(pendingExport?.outputName ?: "clip.mp3")
+        createOutput.launch(pendingExport?.outputName ?: "edited.mp3")
     }
 
     private fun requestConcatExport() {
@@ -309,12 +308,7 @@ class AudioEditorActivity : ComponentActivity() {
             try {
                 // native 只能稳定地写普通路径，因此先写 cacheDir，再通过 ContentResolver 写入 SAF Uri。
                 when (request.kind) {
-                    ExportKind.TRIM -> FfmpegBridge.trim(
-                        request.first.absolutePath,
-                        output.absolutePath,
-                        request.startMs,
-                        request.endMs,
-                    )
+                    ExportKind.SEGMENTS -> exportSegments(request, output)
 
                     ExportKind.CONCAT -> FfmpegBridge.concat(
                         request.first.absolutePath,
@@ -336,6 +330,16 @@ class AudioEditorActivity : ComponentActivity() {
                 output.delete()
             }
         }
+    }
+
+    /** 一次解码并顺序拼接保留分段，删除的分段不会进入最终文件。 */
+    private fun exportSegments(request: ExportRequest, output: File) {
+        require(request.segments.isNotEmpty()) { "没有可导出的音频分段" }
+        FfmpegBridge.keepSegments(
+            request.first.absolutePath,
+            output.absolutePath,
+            request.segments.flatMap { listOf(it.startMs, it.endMs) }.toLongArray(),
+        )
     }
 
     private fun copyUriToCache(uri: Uri): File {
@@ -380,17 +384,25 @@ private fun AudioEditorScreen(
     onChooseFirst: () -> Unit,
     onChooseSecond: () -> Unit,
     onPreview: (startMs: Long, endMs: Long, speed: Double, pitch: Double) -> Unit,
-    onExportTrim: (startMs: Long, endMs: Long) -> Unit,
+    onExportSegments: (List<AudioEditorActivity.AudioSegment>) -> Unit,
     onExportConcat: () -> Unit,
     onStop: () -> Unit,
 ) {
-    var startFraction by remember(firstTrack?.file) { mutableFloatStateOf(0f) }
-    var endFraction by remember(firstTrack?.file) { mutableFloatStateOf(1f) }
+    var playheadFraction by remember(firstTrack?.file) { mutableFloatStateOf(0f) }
+    var segments by remember(firstTrack?.file) {
+        mutableStateOf(
+            firstTrack?.let { listOf(AudioEditorActivity.AudioSegment(0L, it.durationMs)) }
+                .orEmpty(),
+        )
+    }
+    var selectedSegmentIndex by remember(firstTrack?.file) { mutableIntStateOf(0) }
     var speed by remember { mutableFloatStateOf(1f) }
     var pitch by remember { mutableFloatStateOf(0f) }
     val durationMs = firstTrack?.durationMs ?: 1L
-    val startMs = (durationMs * startFraction).roundToInt().toLong()
-    val endMs = (durationMs * endFraction).roundToInt().toLong().coerceAtLeast(startMs + 1L)
+    val playheadMs = (durationMs * playheadFraction).roundToInt().toLong()
+    val selectedSegment = segments.getOrNull(selectedSegmentIndex)
+    val currentSegmentIndex = segments.indexOfFirst { playheadMs >= it.startMs && playheadMs < it.endMs }
+    val currentSegment = segments.getOrNull(currentSegmentIndex)
     val scrollState = rememberScrollState()
 
     Scaffold(
@@ -436,13 +448,13 @@ private fun AudioEditorScreen(
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Text("波形选区", style = MaterialTheme.typography.titleMedium)
+                            Text("音频波形", style = MaterialTheme.typography.titleMedium)
                             Surface(
                                 color = MaterialTheme.colorScheme.primary.copy(alpha = 0.15f),
                                 shape = RoundedCornerShape(50),
                             ) {
                                 Text(
-                                    "${formatTime(startMs)} – ${formatTime(endMs)}",
+                                    "${formatTime(playheadMs)} / ${formatTime(durationMs)}",
                                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
                                     color = MaterialTheme.colorScheme.primary,
                                     style = MaterialTheme.typography.labelMedium,
@@ -451,19 +463,126 @@ private fun AudioEditorScreen(
                         }
                         WaveformSelection(
                             samples = firstTrack.waveform,
-                            startFraction = startFraction,
-                            endFraction = endFraction,
-                            onRangeChanged = { start, end ->
-                                startFraction = start
-                                endFraction = end
+                            playheadFraction = playheadFraction,
+                            segments = segments,
+                            selectedSegmentIndex = selectedSegmentIndex,
+                            durationMs = durationMs,
+                            onProgressChanged = { fraction ->
+                                playheadFraction = fraction
+                                val timeMs = (durationMs * fraction).roundToInt().toLong()
+                                segments.indexOfFirst { timeMs >= it.startMs && timeMs < it.endMs }
+                                    .takeIf { it >= 0 }
+                                    ?.let { selectedSegmentIndex = it }
                             },
                             modifier = Modifier.fillMaxWidth(),
                         )
                         Text(
-                            "拖动两侧把手调整起止点，也可以拖动中间选区整体移动",
+                            "左右滑动波形调整播放进度；中间竖线是当前进度",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Button(
+                                onClick = {
+                                    val splitAtMs = playheadMs.coerceIn(0L, durationMs)
+                                    val segmentIndex = currentSegmentIndex.takeIf {
+                                        it >= 0 && currentSegment != null &&
+                                            splitAtMs > currentSegment.startMs && splitAtMs < currentSegment.endMs
+                                    } ?: -1
+                                    if (segmentIndex >= 0) {
+                                        val source = segments[segmentIndex]
+                                        segments = segments.toMutableList().apply {
+                                            removeAt(segmentIndex)
+                                            add(segmentIndex, AudioEditorActivity.AudioSegment(splitAtMs, source.endMs))
+                                            add(segmentIndex, AudioEditorActivity.AudioSegment(source.startMs, splitAtMs))
+                                        }
+                                        selectedSegmentIndex = segmentIndex + 1
+                                    }
+                                },
+                                enabled = currentSegment != null && playheadMs > currentSegment.startMs &&
+                                    playheadMs < currentSegment.endMs,
+                                modifier = Modifier.weight(1f),
+                            ) { Text("在当前进度分割") }
+                            OutlinedButton(
+                                onClick = {
+                                    if (selectedSegmentIndex in segments.indices) {
+                                        segments = segments.toMutableList().apply { removeAt(selectedSegmentIndex) }
+                                        selectedSegmentIndex = (selectedSegmentIndex - 1).coerceAtLeast(0)
+                                    }
+                                },
+                                enabled = selectedSegment != null,
+                                modifier = Modifier.weight(1f),
+                            ) { Text("删除选中分段") }
+                        }
+                    }
+                }
+
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    shape = RoundedCornerShape(22.dp),
+                ) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text("保留分段", style = MaterialTheme.typography.titleMedium)
+                            Text(
+                                "${segments.size} 段",
+                                color = MaterialTheme.colorScheme.primary,
+                                style = MaterialTheme.typography.labelMedium,
+                            )
+                        }
+                        if (segments.isEmpty()) {
+                            Text("所有分段都已删除，请重新选择音频。", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        } else {
+                            segments.forEachIndexed { index, segment ->
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(14.dp))
+                                        .background(
+                                            if (index == selectedSegmentIndex) {
+                                                MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+                                            } else {
+                                                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)
+                                            },
+                                        )
+                                        .clickable {
+                                            selectedSegmentIndex = index
+                                            playheadFraction = segment.startMs.toFloat() / durationMs
+                                        }
+                                        .padding(start = 12.dp, top = 8.dp, end = 4.dp, bottom = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text(
+                                            "分段 ${index + 1}",
+                                            style = MaterialTheme.typography.labelLarge,
+                                            color = if (index == selectedSegmentIndex) MaterialTheme.colorScheme.primary
+                                            else MaterialTheme.colorScheme.onSurface,
+                                        )
+                                        Text(
+                                            "${formatTime(segment.startMs)} – ${formatTime(segment.endMs)} · ${formatTime(segment.endMs - segment.startMs)}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                    OutlinedButton(
+                                        onClick = {
+                                            segments = segments.toMutableList().apply { removeAt(index) }
+                                            selectedSegmentIndex = when {
+                                                segments.isEmpty() -> 0
+                                                index < selectedSegmentIndex -> selectedSegmentIndex - 1
+                                                index == selectedSegmentIndex -> index.coerceAtMost(segments.lastIndex)
+                                                else -> selectedSegmentIndex
+                                            }
+                                        },
+                                    ) { Text("删除") }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -489,10 +608,14 @@ private fun AudioEditorScreen(
                         )
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             Button(
-                                onClick = { onPreview(startMs, endMs, speed.toDouble(), pitch.toDouble()) },
-                                enabled = !busy && endMs > startMs,
+                                onClick = {
+                                    selectedSegment?.let {
+                                        onPreview(it.startMs, it.endMs, speed.toDouble(), pitch.toDouble())
+                                    }
+                                },
+                                enabled = !busy && selectedSegment != null,
                                 modifier = Modifier.weight(1f),
-                            ) { Text("▶ 预览") }
+                            ) { Text("▶ 预览分段") }
                             OutlinedButton(
                                 onClick = onStop,
                                 enabled = !busy,
@@ -511,10 +634,10 @@ private fun AudioEditorScreen(
 
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Button(
-                    onClick = { onExportTrim(startMs, endMs) },
-                    enabled = !busy && firstTrack != null && endMs > startMs,
+                    onClick = { onExportSegments(segments) },
+                    enabled = !busy && firstTrack != null && segments.isNotEmpty(),
                     modifier = Modifier.weight(1f),
-                ) { Text("导出裁剪") }
+                ) { Text("导出保留分段") }
                 Button(
                     onClick = onExportConcat,
                     enabled = !busy && firstTrack != null && secondTrack != null,
@@ -547,7 +670,7 @@ private fun EditorIntro() {
     Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
         Text("剪辑、塑形、合成", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
         Text(
-            "选择一段音频，拖动波形设定范围；渲染后的结果可以保存为 MP3。",
+            "分割并删除不需要的音频片段，再将保留分段导出为 MP3。",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
@@ -615,114 +738,100 @@ private fun SettingSlider(
 @Composable
 private fun WaveformSelection(
     samples: List<Float>,
-    startFraction: Float,
-    endFraction: Float,
-    onRangeChanged: (start: Float, end: Float) -> Unit,
+    playheadFraction: Float,
+    segments: List<AudioEditorActivity.AudioSegment>,
+    selectedSegmentIndex: Int,
+    durationMs: Long,
+    onProgressChanged: (Float) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val currentStart by rememberUpdatedState(startFraction)
-    val currentEnd by rememberUpdatedState(endFraction)
-    var activeHandle by remember { mutableIntStateOf(0) }
+    val currentPlayheadState = rememberUpdatedState(playheadFraction)
+    val onProgressChangedState = rememberUpdatedState(onProgressChanged)
     val primary = MaterialTheme.colorScheme.primary
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     val background = MaterialTheme.colorScheme.surfaceVariant
-    val density = LocalDensity.current
-    // 热区半径，不再使用固定像素，避免高密度设备上难以命中。
-    val handleHitRadius = with(density) { 20.dp.toPx() }
-    val handleWidth = with(density) { 8.dp.toPx() }
+    val centerLine = MaterialTheme.colorScheme.onSurface
+    // 中央只展示一段时间窗口，滑动时波形会在固定进度线下方移动。
+    val visibleFraction = 0.35f
 
     Canvas(
         modifier = modifier
-            .height(132.dp)
-            .clip(RoundedCornerShape(16.dp))
+            .height(116.dp)
+            .clip(RoundedCornerShape(18.dp))
             .background(background)
-            .pointerInput(samples, onRangeChanged, handleHitRadius) {
+            .pointerInput(samples) {
+                var dragFraction = currentPlayheadState.value
                 detectDragGestures(
-                    onDragStart = { position ->
-                        val width = size.width.toFloat().coerceAtLeast(1f)
-                        val startX = currentStart * width
-                        val endX = currentEnd * width
-                        val startDistance = abs(position.x - startX)
-                        val endDistance = abs(position.x - endX)
-                        activeHandle = when {
-                            minOf(startDistance, endDistance) <= handleHitRadius -> {
-                                // 两个热区重叠时选择距离更近的端点，窄选区也能稳定拖动。
-                                if (startDistance <= endDistance) 1 else 2
-                            }
-                            position.x in startX..endX -> 3
-                            position.x < startX -> 1
-                            else -> 2
-                        }
-                    },
+                    onDragStart = { dragFraction = currentPlayheadState.value },
                     onDrag = { change, dragAmount ->
-                        val delta = dragAmount.x / size.width.toFloat().coerceAtLeast(1f)
-                        val currentStartValue = currentStart
-                        val currentEndValue = currentEnd
-                        when (activeHandle) {
-                            1 -> onRangeChanged(
-                                (currentStartValue + delta).coerceIn(0f, currentEndValue - 0.01f),
-                                currentEndValue,
-                            )
-                            2 -> onRangeChanged(
-                                currentStartValue,
-                                (currentEndValue + delta).coerceIn(currentStartValue + 0.01f, 1f),
-                            )
-                            3 -> {
-                                val span = currentEndValue - currentStartValue
-                                val movedStart = (currentStartValue + delta).coerceIn(0f, 1f - span)
-                                onRangeChanged(movedStart, movedStart + span)
-                            }
-                        }
+                        change.consume()
+                        val width = size.width.toFloat().coerceAtLeast(1f)
+                        val deltaFraction = -dragAmount.x / width * visibleFraction
+                        dragFraction = (dragFraction + deltaFraction).coerceIn(0f, 1f)
+                        onProgressChangedState.value(dragFraction)
                     },
                 )
             },
     ) {
         val width = size.width
         val height = size.height
-        val selectedStart = startFraction * width
-        val selectedEnd = endFraction * width
-        drawRoundRect(background, size = Size(width, height), cornerRadius = CornerRadius(16.dp.toPx()))
+        val centerX = width / 2f
+        val pixelsPerFraction = width / visibleFraction
+        val windowStart = playheadFraction - visibleFraction / 2f
+        val windowEnd = playheadFraction + visibleFraction / 2f
+        fun xAt(fraction: Float) = centerX + (fraction - playheadFraction) * pixelsPerFraction
+
+        drawRoundRect(background, size = Size(width, height), cornerRadius = CornerRadius(18.dp.toPx()))
         val count = samples.size.coerceAtLeast(1)
-        val step = width / count
-        samples.forEachIndexed { index, amplitude ->
-            val x = index * step + step / 2f
-            val barHeight = (amplitude.coerceIn(0.04f, 1f) * height * 0.76f)
-            val selected = x in selectedStart..selectedEnd
+        val step = pixelsPerFraction / count
+        val windowStartIndex = ((windowStart.coerceAtLeast(0f)) * count).toInt().coerceAtLeast(0)
+        val windowEndIndex = ((windowEnd.coerceAtMost(1f)) * count).toInt().coerceAtMost(count)
+        for (index in windowStartIndex until windowEndIndex) {
+            val fraction = (index + 0.5f) / count
+            val x = xAt(fraction)
+            val barHeight = (samples[index].coerceIn(0.035f, 1f) * height * 0.72f)
+            val segmentIndex = segments.indexOfFirst { fraction >= it.startMs.toFloat() / durationMs &&
+                fraction < it.endMs.toFloat() / durationMs }
             drawLine(
-                color = if (selected) primary else muted.copy(alpha = 0.45f),
+                color = when {
+                    segmentIndex < 0 -> muted.copy(alpha = 0.22f)
+                    segmentIndex == selectedSegmentIndex -> primary
+                    else -> primary.copy(alpha = 0.5f)
+                },
                 start = Offset(x, (height - barHeight) / 2f),
                 end = Offset(x, (height + barHeight) / 2f),
-                strokeWidth = (step * 0.55f).coerceAtLeast(1.5f),
+                strokeWidth = (step * 0.48f).coerceAtLeast(2.dp.toPx()),
                 cap = StrokeCap.Round,
             )
         }
-        drawRect(Color.Black.copy(alpha = 0.28f), size = Size(selectedStart, height))
-        drawRect(
-            Color.Black.copy(alpha = 0.28f),
-            topLeft = Offset(selectedEnd, 0f),
-            size = Size((width - selectedEnd).coerceAtLeast(0f), height),
+        segments.flatMap { segment ->
+            listOf(segment.startMs, segment.endMs)
+        }.distinct().filter { it > 0L && it < durationMs }.forEach { boundaryMs ->
+            val split = boundaryMs.toFloat() / durationMs
+            if (split in windowStart..windowEnd) {
+                val x = xAt(split)
+                drawLine(
+                    color = muted.copy(alpha = 0.5f),
+                    start = Offset(x, 12.dp.toPx()),
+                    end = Offset(x, height - 12.dp.toPx()),
+                    strokeWidth = 1.dp.toPx(),
+                )
+            }
+        }
+        // 固定在屏幕中间的进度线，手势只移动波形内容。
+        drawLine(
+            color = centerLine.copy(alpha = 0.96f),
+            start = Offset(centerX, 8.dp.toPx()),
+            end = Offset(centerX, height - 8.dp.toPx()),
+            strokeWidth = 2.dp.toPx(),
         )
+        drawCircle(primary, radius = 5.dp.toPx(), center = Offset(centerX, 8.dp.toPx()))
+        drawCircle(primary, radius = 5.dp.toPx(), center = Offset(centerX, height - 8.dp.toPx()))
         drawRoundRect(
-            primary.copy(alpha = 0.22f),
-            topLeft = Offset(selectedStart, 0f),
-            size = Size((selectedEnd - selectedStart).coerceAtLeast(0f), height),
-            cornerRadius = androidx.compose.ui.geometry.CornerRadius(10.dp.toPx()),
-            style = Stroke(width = 1.dp.toPx()),
-        )
-        drawLine(primary, Offset(selectedStart, 0f), Offset(selectedStart, height), strokeWidth = 3.dp.toPx())
-        drawLine(primary, Offset(selectedEnd, 0f), Offset(selectedEnd, height), strokeWidth = 3.dp.toPx())
-        // 把手覆盖在波形内部，左右端点也保留完整可见面积。
-        drawRoundRect(
-            color = primary,
-            topLeft = Offset((selectedStart - handleWidth / 2f).coerceIn(0f, width - handleWidth), 0f),
-            size = Size(handleWidth, height),
-            cornerRadius = androidx.compose.ui.geometry.CornerRadius(handleWidth / 2f),
-        )
-        drawRoundRect(
-            color = primary,
-            topLeft = Offset((selectedEnd - handleWidth / 2f).coerceIn(0f, width - handleWidth), 0f),
-            size = Size(handleWidth, height),
-            cornerRadius = androidx.compose.ui.geometry.CornerRadius(handleWidth / 2f),
+            color = primary.copy(alpha = 0.14f),
+            topLeft = Offset(centerX - 14.dp.toPx(), height - 20.dp.toPx()),
+            size = Size(28.dp.toPx(), 12.dp.toPx()),
+            cornerRadius = CornerRadius(6.dp.toPx()),
         )
     }
 }

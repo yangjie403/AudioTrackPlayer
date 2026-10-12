@@ -38,6 +38,12 @@ object FfmpegBridge {
         endMs: Long,
     )
 
+    private external fun nativeKeepSegments(
+        inputPath: String,
+        outputPath: String,
+        boundariesMs: LongArray,
+    )
+
     private external fun nativeTempoPitch(
         inputPath: String,
         outputPath: String,
@@ -92,6 +98,25 @@ object FfmpegBridge {
     fun trim(inputPath: String, outputPath: String, startMs: Long, endMs: Long) {
         require(endMs > startMs) { "endMs must be greater than startMs" }
         nativeTrim(inputPath, outputPath, startMs, endMs)
+    }
+
+    /** 只保留 [boundariesMs] 中的成对时间段，并在一次转码中顺序拼接输出。 */
+    fun keepSegments(inputPath: String, outputPath: String, boundariesMs: LongArray) {
+        require(inputPath.isNotBlank()) { "inputPath must not be blank" }
+        require(outputPath.isNotBlank()) { "outputPath must not be blank" }
+        require(boundariesMs.isNotEmpty() && boundariesMs.size % 2 == 0) {
+            "boundariesMs must contain start/end pairs"
+        }
+        var previousEnd = 0L
+        for (index in boundariesMs.indices step 2) {
+            val start = boundariesMs[index]
+            val end = boundariesMs[index + 1]
+            require(start >= previousEnd && end > start) {
+                "segments must be ordered, non-overlapping start/end pairs"
+            }
+            previousEnd = end
+        }
+        nativeKeepSegments(inputPath, outputPath, boundariesMs)
     }
 
     /**
