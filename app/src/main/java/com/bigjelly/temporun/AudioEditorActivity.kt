@@ -38,9 +38,11 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -114,6 +116,11 @@ class AudioEditorActivity : ComponentActivity() {
     private val secondTrackState = mutableStateOf<Track?>(null)
     private val statusState = mutableStateOf("正在加载示例音频…")
     private val busyState = mutableStateOf(true)
+    private val playbackPositionState = mutableLongStateOf(0L)
+    private val waveformPlayingState = mutableStateOf(false)
+    private var waveformPlaybackActive = false
+    private var waveformPlaybackSegments: List<AudioSegment> = emptyList()
+    private var waveformPlaybackSegmentIndex = -1
 
     // OpenDocument 返回的是 content:// Uri，回调中会复制到 cacheDir 后再交给 FFmpeg。
     private val openAudio = registerForActivityResult(
@@ -133,29 +140,69 @@ class AudioEditorActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        player.onProgressListener = { currentMs, _ ->
+            handleWaveformProgress(currentMs)
+        }
+        player.onStateChangedListener = { state ->
+            when (state) {
+                AdvancedAudioPlayer.State.PLAYING,
+                AdvancedAudioPlayer.State.PREPARING -> {
+                    if (waveformPlaybackActive) waveformPlayingState.value = true
+                }
+
+                AdvancedAudioPlayer.State.PAUSED,
+                AdvancedAudioPlayer.State.STOPPED -> waveformPlayingState.value = false
+
+                AdvancedAudioPlayer.State.COMPLETED,
+                AdvancedAudioPlayer.State.ERROR -> {
+                    waveformPlaybackActive = false
+                    waveformPlayingState.value = false
+                }
+
+                AdvancedAudioPlayer.State.IDLE -> Unit
+            }
+        }
+        player.onCompletionListener = {
+            waveformPlaybackActive = false
+            waveformPlayingState.value = false
+            statusState.value = "播放完成"
+        }
         setContent {
             val firstTrack by firstTrackState
             val secondTrack by secondTrackState
             val status by statusState
             val busy by busyState
+            val playbackPositionMs = playbackPositionState.longValue
+            val waveformPlaying by waveformPlayingState
             MaterialTheme(colorScheme = editorColors()) {
                 AudioEditorScreen(
                     firstTrack = firstTrack,
                     secondTrack = secondTrack,
                     status = status,
                     busy = busy,
+                    playbackPositionMs = playbackPositionMs,
+                    waveformPlaying = waveformPlaying,
                     onChooseFirst = {
+                        waveformPlaybackActive = false
+                        waveformPlayingState.value = false
+                        player.stop()
                         importTarget = ImportTarget.FIRST
                         openAudio.launch(arrayOf("audio/*"))
                     },
                     onChooseSecond = {
+                        pauseWaveformPlayback()
                         importTarget = ImportTarget.SECOND
                         openAudio.launch(arrayOf("audio/*"))
                     },
                     onPreview = ::previewSelection,
+                    onToggleWaveformPlayback = ::toggleWaveformPlayback,
+                    onPausePlayback = ::pauseWaveformPlayback,
+                    onSeekPlayback = ::seekWaveformPlayback,
                     onExportSegments = ::requestSegmentsExport,
                     onExportConcat = ::requestConcatExport,
                     onStop = {
+                        waveformPlaybackActive = false
+                        waveformPlayingState.value = false
                         player.stop()
                         statusState.value = "播放已停止"
                     },
@@ -166,6 +213,8 @@ class AudioEditorActivity : ComponentActivity() {
     }
 
     override fun onStop() {
+        waveformPlaybackActive = false
+        waveformPlayingState.value = false
         player.stop()
         previewTempFile?.delete()
         previewTempFile = null
@@ -173,6 +222,11 @@ class AudioEditorActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        waveformPlaybackActive = false
+        waveformPlayingState.value = false
+        player.onProgressListener = null
+        player.onCompletionListener = null
+        player.onStateChangedListener = null
         player.stop()
         executor.shutdownNow()
         firstTempFile?.delete()
@@ -189,6 +243,7 @@ class AudioEditorActivity : ComponentActivity() {
                 assets.open("music.mp3").use { input -> file.outputStream().use(input::copyTo) }
                 val track = readTrack(file, "示例音频 · music.mp3")
                 firstTempFile = file
+                playbackPositionState.longValue = 0L
                 firstTrackState.value = track
                 busyState.value = false
                 statusState.value = "左右滑动波形调整进度，在当前进度分割音频"
@@ -212,6 +267,7 @@ class AudioEditorActivity : ComponentActivity() {
                 if (target == ImportTarget.FIRST) {
                     firstTempFile?.delete()
                     firstTempFile = temp
+                    playbackPositionState.longValue = 0L
                     firstTrackState.value = track
                 } else {
                     secondTempFile?.delete()
@@ -244,6 +300,8 @@ class AudioEditorActivity : ComponentActivity() {
 
     private fun previewSelection(startMs: Long, endMs: Long, speed: Double, pitch: Double) {
         val track = firstTrackState.value ?: return
+        waveformPlaybackActive = false
+        waveformPlayingState.value = false
         busyState.value = true
         statusState.value = "正在渲染变速变调预览…"
         player.stop()
@@ -271,6 +329,89 @@ class AudioEditorActivity : ComponentActivity() {
                 busyState.value = false
                 statusState.value = "预览失败：${error.message ?: error.javaClass.simpleName}"
                 runOnUiThread { toast(statusState.value) }
+            }
+        }
+    }
+
+    private fun toggleWaveformPlayback(segments: List<AudioSegment>, positionMs: Long) {
+        if (segments.isEmpty()) return
+        if (waveformPlaybackActive && player.state in setOf(
+                AdvancedAudioPlayer.State.PLAYING,
+                AdvancedAudioPlayer.State.PREPARING,
+            )
+        ) {
+            waveformPlaybackActive = false
+            player.pause()
+            waveformPlayingState.value = false
+            statusState.value = "播放已暂停"
+            return
+        }
+
+        val track = firstTrackState.value ?: return
+        val startMs = findPlaybackStart(positionMs, segments)
+        waveformPlaybackSegments = segments
+        waveformPlaybackSegmentIndex = segments.indexOfFirst {
+            startMs >= it.startMs && startMs < it.endMs
+        }.coerceAtLeast(0)
+        waveformPlaybackActive = false
+        player.playFromFilePath(this, track.file.absolutePath)
+        waveformPlaybackActive = true
+        waveformPlayingState.value = true
+        playbackPositionState.longValue = startMs
+        player.seekTo(startMs)
+        statusState.value = "正在播放预览"
+    }
+
+    private fun pauseWaveformPlayback() {
+        if (waveformPlaybackActive && player.state in setOf(
+                AdvancedAudioPlayer.State.PLAYING,
+                AdvancedAudioPlayer.State.PREPARING,
+            )
+        ) {
+            waveformPlaybackActive = false
+            player.pause()
+            waveformPlayingState.value = false
+            statusState.value = "播放已暂停"
+        }
+    }
+
+    private fun seekWaveformPlayback(positionMs: Long) {
+        if (waveformPlaybackActive) player.seekTo(positionMs)
+    }
+
+    private fun findPlaybackStart(positionMs: Long, segments: List<AudioSegment>): Long {
+        val first = segments.firstOrNull() ?: return 0L
+        val current = segments.firstOrNull { positionMs >= it.startMs && positionMs < it.endMs }
+        return current?.let { positionMs.coerceAtLeast(it.startMs) }
+            ?: segments.firstOrNull { it.startMs >= positionMs }?.startMs
+            ?: first.startMs
+    }
+
+    private fun handleWaveformProgress(currentMs: Long) {
+        if (!waveformPlaybackActive) return
+        playbackPositionState.longValue = currentMs
+        val segments = waveformPlaybackSegments
+        val currentSegment = segments.getOrNull(waveformPlaybackSegmentIndex) ?: return
+        if (currentMs < currentSegment.startMs) {
+            // MediaExtractor 只能跳到附近的同步帧，实际回调可能暂时早于目标分段。
+            // 重新发起 seek，避免进度线落回已删除的区间。
+            playbackPositionState.longValue = currentSegment.startMs
+            player.seekTo(currentSegment.startMs)
+            return
+        }
+        if (currentMs >= currentSegment.endMs) {
+            val nextIndex = segments.indexOfFirst { it.startMs >= currentSegment.endMs }
+            val next = segments.getOrNull(nextIndex)
+            if (next != null) {
+                waveformPlaybackSegmentIndex = nextIndex
+                playbackPositionState.longValue = next.startMs
+                player.seekTo(next.startMs)
+            } else {
+                waveformPlaybackActive = false
+                player.pause()
+                playbackPositionState.longValue = currentSegment.endMs
+                waveformPlayingState.value = false
+                statusState.value = "播放到最后一个保留分段"
             }
         }
     }
@@ -381,9 +522,14 @@ private fun AudioEditorScreen(
     secondTrack: AudioEditorActivity.Track?,
     status: String,
     busy: Boolean,
+    playbackPositionMs: Long,
+    waveformPlaying: Boolean,
     onChooseFirst: () -> Unit,
     onChooseSecond: () -> Unit,
     onPreview: (startMs: Long, endMs: Long, speed: Double, pitch: Double) -> Unit,
+    onToggleWaveformPlayback: (List<AudioEditorActivity.AudioSegment>, Long) -> Unit,
+    onPausePlayback: () -> Unit,
+    onSeekPlayback: (Long) -> Unit,
     onExportSegments: (List<AudioEditorActivity.AudioSegment>) -> Unit,
     onExportConcat: () -> Unit,
     onStop: () -> Unit,
@@ -399,6 +545,14 @@ private fun AudioEditorScreen(
     var speed by remember { mutableFloatStateOf(1f) }
     var pitch by remember { mutableFloatStateOf(0f) }
     val durationMs = firstTrack?.durationMs ?: 1L
+    LaunchedEffect(playbackPositionMs, durationMs) {
+        if (durationMs > 0L) {
+            playheadFraction = (playbackPositionMs.toFloat() / durationMs).coerceIn(0f, 1f)
+            segments.indexOfFirst {
+                playbackPositionMs >= it.startMs && playbackPositionMs < it.endMs
+            }.takeIf { it >= 0 }?.let { selectedSegmentIndex = it }
+        }
+    }
     val playheadMs = (durationMs * playheadFraction).roundToInt().toLong()
     val selectedSegment = segments.getOrNull(selectedSegmentIndex)
     val currentSegmentIndex = segments.indexOfFirst { playheadMs >= it.startMs && playheadMs < it.endMs }
@@ -468,14 +622,23 @@ private fun AudioEditorScreen(
                             selectedSegmentIndex = selectedSegmentIndex,
                             durationMs = durationMs,
                             onProgressChanged = { fraction ->
+                                onPausePlayback()
                                 playheadFraction = fraction
                                 val timeMs = (durationMs * fraction).roundToInt().toLong()
+                                onSeekPlayback(timeMs)
                                 segments.indexOfFirst { timeMs >= it.startMs && timeMs < it.endMs }
                                     .takeIf { it >= 0 }
                                     ?.let { selectedSegmentIndex = it }
                             },
                             modifier = Modifier.fillMaxWidth(),
                         )
+                        Button(
+                            onClick = { onToggleWaveformPlayback(segments, playheadMs) },
+                            enabled = !busy && segments.isNotEmpty(),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(if (waveformPlaying) "Ⅱ 暂停播放" else "▶ 播放预览")
+                        }
                         Text(
                             "左右滑动波形调整播放进度；中间竖线是当前进度",
                             style = MaterialTheme.typography.bodySmall,
@@ -484,6 +647,7 @@ private fun AudioEditorScreen(
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             Button(
                                 onClick = {
+                                    onPausePlayback()
                                     val splitAtMs = playheadMs.coerceIn(0L, durationMs)
                                     val segmentIndex = currentSegmentIndex.takeIf {
                                         it >= 0 && currentSegment != null &&
@@ -505,6 +669,7 @@ private fun AudioEditorScreen(
                             ) { Text("在当前进度分割") }
                             OutlinedButton(
                                 onClick = {
+                                    onPausePlayback()
                                     if (selectedSegmentIndex in segments.indices) {
                                         segments = segments.toMutableList().apply { removeAt(selectedSegmentIndex) }
                                         selectedSegmentIndex = (selectedSegmentIndex - 1).coerceAtLeast(0)
@@ -550,8 +715,10 @@ private fun AudioEditorScreen(
                                             },
                                         )
                                         .clickable {
+                                            onPausePlayback()
                                             selectedSegmentIndex = index
                                             playheadFraction = segment.startMs.toFloat() / durationMs
+                                            onSeekPlayback(segment.startMs)
                                         }
                                         .padding(start = 12.dp, top = 8.dp, end = 4.dp, bottom = 8.dp),
                                     verticalAlignment = Alignment.CenterVertically,
@@ -571,6 +738,7 @@ private fun AudioEditorScreen(
                                     }
                                     OutlinedButton(
                                         onClick = {
+                                            onPausePlayback()
                                             segments = segments.toMutableList().apply { removeAt(index) }
                                             selectedSegmentIndex = when {
                                                 segments.isEmpty() -> 0
