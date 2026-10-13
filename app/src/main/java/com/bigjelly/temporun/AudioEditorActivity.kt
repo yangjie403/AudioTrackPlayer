@@ -4,6 +4,7 @@ import android.database.Cursor
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -39,6 +40,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -168,13 +170,13 @@ class AudioEditorActivity : ComponentActivity() {
             statusState.value = "播放完成"
         }
         setContent {
-            val firstTrack by firstTrackState
-            val secondTrack by secondTrackState
-            val status by statusState
-            val busy by busyState
-            val playbackPositionMs = playbackPositionState.longValue
-            val waveformPlaying by waveformPlayingState
             MaterialTheme(colorScheme = editorColors()) {
+                val firstTrack by firstTrackState
+                val secondTrack by secondTrackState
+                val status by statusState
+                val busy by busyState
+                val playbackPositionMs = playbackPositionState.longValue
+                val waveformPlaying by waveformPlayingState
                 AudioEditorScreen(
                     firstTrack = firstTrack,
                     secondTrack = secondTrack,
@@ -289,7 +291,7 @@ class AudioEditorActivity : ComponentActivity() {
     private fun readTrack(file: File, name: String): Track {
         // probe 提供时长；waveform 解码整段音频并返回固定数量的归一化峰值。
         val probe = FfmpegBridge.probe(file.absolutePath)
-        val waveform = FfmpegBridge.waveform(file.absolutePath).toList()
+        val waveform = FfmpegBridge.waveform(file.absolutePath, 2000).toList()
         return Track(
             file = file,
             name = name,
@@ -505,7 +507,6 @@ class AudioEditorActivity : ComponentActivity() {
     }
 }
 
-@Composable
 private fun editorColors() = darkColorScheme(
     primary = Color(0xFF8BD7FF),
     onPrimary = Color(0xFF003548),
@@ -534,7 +535,7 @@ private fun AudioEditorScreen(
     onExportConcat: () -> Unit,
     onStop: () -> Unit,
 ) {
-    var playheadFraction by remember(firstTrack?.file) { mutableFloatStateOf(0f) }
+    var playHeadFraction by remember(firstTrack?.file) { mutableFloatStateOf(0f) }
     var segments by remember(firstTrack?.file) {
         mutableStateOf(
             firstTrack?.let { listOf(AudioEditorActivity.AudioSegment(0L, it.durationMs)) }
@@ -547,18 +548,75 @@ private fun AudioEditorScreen(
     val durationMs = firstTrack?.durationMs ?: 1L
     LaunchedEffect(playbackPositionMs, durationMs) {
         if (durationMs > 0L) {
-            playheadFraction = (playbackPositionMs.toFloat() / durationMs).coerceIn(0f, 1f)
+            playHeadFraction = (playbackPositionMs.toFloat() / durationMs).coerceIn(0f, 1f)
             segments.indexOfFirst {
                 playbackPositionMs >= it.startMs && playbackPositionMs < it.endMs
             }.takeIf { it >= 0 }?.let { selectedSegmentIndex = it }
         }
     }
-    val playheadMs = (durationMs * playheadFraction).roundToInt().toLong()
+    val playHeadMs = (durationMs * playHeadFraction).roundToInt().toLong()
     val selectedSegment = segments.getOrNull(selectedSegmentIndex)
-    val currentSegmentIndex = segments.indexOfFirst { playheadMs >= it.startMs && playheadMs < it.endMs }
+    val currentSegmentIndex =
+        segments.indexOfFirst { playHeadMs >= it.startMs && playHeadMs < it.endMs }
     val currentSegment = segments.getOrNull(currentSegmentIndex)
     val scrollState = rememberScrollState()
+    val canDeleteSegment by remember(firstTrack?.file) {
+        derivedStateOf { segments.size > 1 }
+    }
+    val canPlay by remember(firstTrack?.file) {
+        derivedStateOf {
+            !busy && segments.isNotEmpty()
+        }
+    }
+    val canSplitSegment by remember(firstTrack?.file) {
+        derivedStateOf {
+            val currentPlayHeadMs =
+                (durationMs * playHeadFraction).roundToInt().toLong()
+            val segment = segments.firstOrNull {
+                currentPlayHeadMs >= it.startMs && currentPlayHeadMs < it.endMs
+            }
 
+            segment != null &&
+                    currentPlayHeadMs > segment.startMs &&
+                    currentPlayHeadMs < segment.endMs
+        }
+    }
+
+    val splitSegment = {
+        onPausePlayback()
+        val splitAtMs = playHeadMs.coerceIn(0L, durationMs)
+        val segmentIndex = currentSegmentIndex.takeIf {
+            it >= 0 && currentSegment != null &&
+                    splitAtMs > currentSegment.startMs && splitAtMs < currentSegment.endMs
+        } ?: -1
+        if (segmentIndex >= 0) {
+            val source = segments[segmentIndex]
+            segments = segments.toMutableList().apply {
+                removeAt(segmentIndex)
+                add(
+                    segmentIndex,
+                    AudioEditorActivity.AudioSegment(
+                        splitAtMs,
+                        source.endMs
+                    )
+                )
+                add(
+                    segmentIndex,
+                    AudioEditorActivity.AudioSegment(
+                        source.startMs,
+                        splitAtMs
+                    )
+                )
+            }
+            selectedSegmentIndex = segmentIndex + 1
+        }
+        Log.d("AudioEditorScreen", "segments size: ${segments.size}")
+    }
+    val splitSegmentState = rememberUpdatedState(splitSegment)
+    val onTogglePlayback = {
+        onToggleWaveformPlayback(segments, playHeadMs)
+    }
+    val onToggleWaveformPlaybackState = rememberUpdatedState(onTogglePlayback)
     Scaffold(
         topBar = {
             TopAppBar(
@@ -596,7 +654,10 @@ private fun AudioEditorScreen(
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                     shape = RoundedCornerShape(22.dp),
                 ) {
-                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Column(
+                        Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
                         Row(
                             Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
@@ -608,8 +669,11 @@ private fun AudioEditorScreen(
                                 shape = RoundedCornerShape(50),
                             ) {
                                 Text(
-                                    "${formatTime(playheadMs)} / ${formatTime(durationMs)}",
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                    "${formatTime(playHeadMs)} / ${formatTime(durationMs)}",
+                                    modifier = Modifier.padding(
+                                        horizontal = 10.dp,
+                                        vertical = 5.dp
+                                    ),
                                     color = MaterialTheme.colorScheme.primary,
                                     style = MaterialTheme.typography.labelMedium,
                                 )
@@ -617,24 +681,30 @@ private fun AudioEditorScreen(
                         }
                         WaveformSelection(
                             samples = firstTrack.waveform,
-                            playheadFraction = playheadFraction,
+                            playHeadFraction = playHeadFraction,
                             segments = segments,
                             selectedSegmentIndex = selectedSegmentIndex,
                             durationMs = durationMs,
-                            onProgressChanged = { fraction ->
+                            onDragStart = {
                                 onPausePlayback()
-                                playheadFraction = fraction
+                            },
+                            onProgressChanged = { fraction ->
+                                playHeadFraction = fraction
                                 val timeMs = (durationMs * fraction).roundToInt().toLong()
-                                onSeekPlayback(timeMs)
                                 segments.indexOfFirst { timeMs >= it.startMs && timeMs < it.endMs }
                                     .takeIf { it >= 0 }
                                     ?.let { selectedSegmentIndex = it }
                             },
+                            onDragEndOrCancel = { fraction ->
+                                playHeadFraction = fraction
+                                val timeMs = (durationMs * fraction).roundToInt().toLong()
+                                onSeekPlayback(timeMs)
+                            },
                             modifier = Modifier.fillMaxWidth(),
                         )
                         Button(
-                            onClick = { onToggleWaveformPlayback(segments, playheadMs) },
-                            enabled = !busy && segments.isNotEmpty(),
+                            onClick = { onToggleWaveformPlaybackState.value() },
+                            enabled = canPlay,
                             modifier = Modifier.fillMaxWidth(),
                         ) {
                             Text(if (waveformPlaying) "Ⅱ 暂停播放" else "▶ 播放预览")
@@ -647,35 +717,22 @@ private fun AudioEditorScreen(
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             Button(
                                 onClick = {
-                                    onPausePlayback()
-                                    val splitAtMs = playheadMs.coerceIn(0L, durationMs)
-                                    val segmentIndex = currentSegmentIndex.takeIf {
-                                        it >= 0 && currentSegment != null &&
-                                            splitAtMs > currentSegment.startMs && splitAtMs < currentSegment.endMs
-                                    } ?: -1
-                                    if (segmentIndex >= 0) {
-                                        val source = segments[segmentIndex]
-                                        segments = segments.toMutableList().apply {
-                                            removeAt(segmentIndex)
-                                            add(segmentIndex, AudioEditorActivity.AudioSegment(splitAtMs, source.endMs))
-                                            add(segmentIndex, AudioEditorActivity.AudioSegment(source.startMs, splitAtMs))
-                                        }
-                                        selectedSegmentIndex = segmentIndex + 1
-                                    }
+                                    splitSegmentState.value.invoke()
                                 },
-                                enabled = currentSegment != null && playheadMs > currentSegment.startMs &&
-                                    playheadMs < currentSegment.endMs,
+                                enabled = canSplitSegment,
                                 modifier = Modifier.weight(1f),
                             ) { Text("在当前进度分割") }
                             OutlinedButton(
                                 onClick = {
                                     onPausePlayback()
                                     if (selectedSegmentIndex in segments.indices) {
-                                        segments = segments.toMutableList().apply { removeAt(selectedSegmentIndex) }
-                                        selectedSegmentIndex = (selectedSegmentIndex - 1).coerceAtLeast(0)
+                                        segments = segments.toMutableList()
+                                            .apply { removeAt(selectedSegmentIndex) }
+                                        selectedSegmentIndex =
+                                            (selectedSegmentIndex - 1).coerceAtLeast(0)
                                     }
                                 },
-                                enabled = selectedSegment != null,
+                                enabled = selectedSegment != null && canDeleteSegment,
                                 modifier = Modifier.weight(1f),
                             ) { Text("删除选中分段") }
                         }
@@ -686,7 +743,10 @@ private fun AudioEditorScreen(
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                     shape = RoundedCornerShape(22.dp),
                 ) {
-                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Column(
+                        Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
@@ -700,7 +760,10 @@ private fun AudioEditorScreen(
                             )
                         }
                         if (segments.isEmpty()) {
-                            Text("所有分段都已删除，请重新选择音频。", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(
+                                "所有分段都已删除，请重新选择音频。",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
                         } else {
                             segments.forEachIndexed { index, segment ->
                                 Row(
@@ -717,10 +780,16 @@ private fun AudioEditorScreen(
                                         .clickable {
                                             onPausePlayback()
                                             selectedSegmentIndex = index
-                                            playheadFraction = segment.startMs.toFloat() / durationMs
+                                            playHeadFraction =
+                                                segment.startMs.toFloat() / durationMs
                                             onSeekPlayback(segment.startMs)
                                         }
-                                        .padding(start = 12.dp, top = 8.dp, end = 4.dp, bottom = 8.dp),
+                                        .padding(
+                                            start = 12.dp,
+                                            top = 8.dp,
+                                            end = 4.dp,
+                                            bottom = 8.dp
+                                        ),
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
                                     Column(Modifier.weight(1f)) {
@@ -731,19 +800,28 @@ private fun AudioEditorScreen(
                                             else MaterialTheme.colorScheme.onSurface,
                                         )
                                         Text(
-                                            "${formatTime(segment.startMs)} – ${formatTime(segment.endMs)} · ${formatTime(segment.endMs - segment.startMs)}",
+                                            "${formatTime(segment.startMs)} – ${formatTime(segment.endMs)} · ${
+                                                formatTime(
+                                                    segment.endMs - segment.startMs
+                                                )
+                                            }",
                                             style = MaterialTheme.typography.bodySmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                                         )
                                     }
                                     OutlinedButton(
+                                        enabled = canDeleteSegment,
                                         onClick = {
                                             onPausePlayback()
-                                            segments = segments.toMutableList().apply { removeAt(index) }
+                                            segments =
+                                                segments.toMutableList().apply { removeAt(index) }
                                             selectedSegmentIndex = when {
                                                 segments.isEmpty() -> 0
                                                 index < selectedSegmentIndex -> selectedSegmentIndex - 1
-                                                index == selectedSegmentIndex -> index.coerceAtMost(segments.lastIndex)
+                                                index == selectedSegmentIndex -> index.coerceAtMost(
+                                                    segments.lastIndex
+                                                )
+
                                                 else -> selectedSegmentIndex
                                             }
                                         },
@@ -758,7 +836,10 @@ private fun AudioEditorScreen(
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                     shape = RoundedCornerShape(22.dp),
                 ) {
-                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Column(
+                        Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
                         Text("变速变调预览", style = MaterialTheme.typography.titleMedium)
                         SettingSlider(
                             label = "速度",
@@ -769,7 +850,9 @@ private fun AudioEditorScreen(
                         )
                         SettingSlider(
                             label = "音调",
-                            valueText = "${pitch.roundToInt().let { if (it >= 0) "+$it" else it }} 半音",
+                            valueText = "${
+                                pitch.roundToInt().let { if (it >= 0) "+$it" else it }
+                            } 半音",
                             value = pitch,
                             range = -12f..12f,
                             onValueChange = { pitch = it },
@@ -778,7 +861,12 @@ private fun AudioEditorScreen(
                             Button(
                                 onClick = {
                                     selectedSegment?.let {
-                                        onPreview(it.startMs, it.endMs, speed.toDouble(), pitch.toDouble())
+                                        onPreview(
+                                            it.startMs,
+                                            it.endMs,
+                                            speed.toDouble(),
+                                            pitch.toDouble()
+                                        )
                                     }
                                 },
                                 enabled = !busy && selectedSegment != null,
@@ -817,7 +905,9 @@ private fun AudioEditorScreen(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 if (busy) {
                     CircularProgressIndicator(
-                        modifier = Modifier.width(20.dp).height(20.dp),
+                        modifier = Modifier
+                            .width(20.dp)
+                            .height(20.dp),
                         strokeWidth = 2.dp,
                     )
                     Spacer(Modifier.width(10.dp))
@@ -836,7 +926,11 @@ private fun AudioEditorScreen(
 @Composable
 private fun EditorIntro() {
     Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
-        Text("剪辑、塑形、合成", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+        Text(
+            "剪辑、塑形、合成",
+            style = MaterialTheme.typography.headlineSmall,
+            fontWeight = FontWeight.Bold
+        )
         Text(
             "分割并删除不需要的音频片段，再将保留分段导出为 MP3。",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -855,11 +949,17 @@ private fun TrackCard(
         shape = RoundedCornerShape(22.dp),
     ) {
         Row(
-            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(title, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                Text(
+                    title,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.primary
+                )
                 Text(
                     track?.name ?: "还没有选择音频",
                     style = MaterialTheme.typography.titleMedium,
@@ -867,7 +967,8 @@ private fun TrackCard(
                     maxLines = 1,
                 )
                 Text(
-                    track?.let { "${formatTime(it.durationMs)} · 已生成波形" } ?: "支持 MP3、WAV、FLAC、OGG、AAC 等格式",
+                    track?.let { "${formatTime(it.durationMs)} · 已生成波形" }
+                        ?: "支持 MP3、WAV、FLAC、OGG、AAC 等格式",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -905,16 +1006,20 @@ private fun SettingSlider(
 
 @Composable
 private fun WaveformSelection(
+    modifier: Modifier = Modifier,
     samples: List<Float>,
-    playheadFraction: Float,
+    playHeadFraction: Float,
     segments: List<AudioEditorActivity.AudioSegment>,
     selectedSegmentIndex: Int,
     durationMs: Long,
+    onDragStart: () -> Unit = {},
     onProgressChanged: (Float) -> Unit,
-    modifier: Modifier = Modifier,
+    onDragEndOrCancel: (Float) -> Unit = {},
 ) {
-    val currentPlayheadState = rememberUpdatedState(playheadFraction)
+    val onDragStartState = rememberUpdatedState(onDragStart)
+    val currentPlayHeadState = rememberUpdatedState(playHeadFraction)
     val onProgressChangedState = rememberUpdatedState(onProgressChanged)
+    val onDragEndOrCancelState = rememberUpdatedState(onDragEndOrCancel)
     val primary = MaterialTheme.colorScheme.primary
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     val background = MaterialTheme.colorScheme.surfaceVariant
@@ -928,9 +1033,12 @@ private fun WaveformSelection(
             .clip(RoundedCornerShape(18.dp))
             .background(background)
             .pointerInput(samples) {
-                var dragFraction = currentPlayheadState.value
+                var dragFraction = currentPlayHeadState.value
                 detectDragGestures(
-                    onDragStart = { dragFraction = currentPlayheadState.value },
+                    onDragStart = {
+                        onDragStartState.value()
+                        dragFraction = currentPlayHeadState.value
+                    },
                     onDrag = { change, dragAmount ->
                         change.consume()
                         val width = size.width.toFloat().coerceAtLeast(1f)
@@ -938,6 +1046,12 @@ private fun WaveformSelection(
                         dragFraction = (dragFraction + deltaFraction).coerceIn(0f, 1f)
                         onProgressChangedState.value(dragFraction)
                     },
+                    onDragEnd = {
+                        onDragEndOrCancelState.value(dragFraction)
+                    },
+                    onDragCancel = {
+                        onDragEndOrCancelState.value(dragFraction)
+                    }
                 )
             },
     ) {
@@ -945,11 +1059,15 @@ private fun WaveformSelection(
         val height = size.height
         val centerX = width / 2f
         val pixelsPerFraction = width / visibleFraction
-        val windowStart = playheadFraction - visibleFraction / 2f
-        val windowEnd = playheadFraction + visibleFraction / 2f
-        fun xAt(fraction: Float) = centerX + (fraction - playheadFraction) * pixelsPerFraction
+        val windowStart = playHeadFraction - visibleFraction / 2f
+        val windowEnd = playHeadFraction + visibleFraction / 2f
+        fun xAt(fraction: Float) = centerX + (fraction - playHeadFraction) * pixelsPerFraction
 
-        drawRoundRect(background, size = Size(width, height), cornerRadius = CornerRadius(18.dp.toPx()))
+        drawRoundRect(
+            background,
+            size = Size(width, height),
+            cornerRadius = CornerRadius(18.dp.toPx())
+        )
         val count = samples.size.coerceAtLeast(1)
         val step = pixelsPerFraction / count
         val windowStartIndex = ((windowStart.coerceAtLeast(0f)) * count).toInt().coerceAtLeast(0)
@@ -958,8 +1076,10 @@ private fun WaveformSelection(
             val fraction = (index + 0.5f) / count
             val x = xAt(fraction)
             val barHeight = (samples[index].coerceIn(0.035f, 1f) * height * 0.72f)
-            val segmentIndex = segments.indexOfFirst { fraction >= it.startMs.toFloat() / durationMs &&
-                fraction < it.endMs.toFloat() / durationMs }
+            val segmentIndex = segments.indexOfFirst {
+                fraction >= it.startMs.toFloat() / durationMs &&
+                        fraction < it.endMs.toFloat() / durationMs
+            }
             drawLine(
                 color = when {
                     segmentIndex < 0 -> muted.copy(alpha = 0.22f)
@@ -968,13 +1088,13 @@ private fun WaveformSelection(
                 },
                 start = Offset(x, (height - barHeight) / 2f),
                 end = Offset(x, (height + barHeight) / 2f),
-                strokeWidth = (step * 0.48f).coerceAtLeast(2.dp.toPx()),
+                strokeWidth = (step * 0.48f).coerceAtLeast(1f),
                 cap = StrokeCap.Round,
             )
         }
         segments.flatMap { segment ->
             listOf(segment.startMs, segment.endMs)
-        }.distinct().filter { it > 0L && it < durationMs }.forEach { boundaryMs ->
+        }.distinct().filter { it in 1..<durationMs }.forEach { boundaryMs ->
             val split = boundaryMs.toFloat() / durationMs
             if (split in windowStart..windowEnd) {
                 val x = xAt(split)
@@ -995,12 +1115,6 @@ private fun WaveformSelection(
         )
         drawCircle(primary, radius = 5.dp.toPx(), center = Offset(centerX, 8.dp.toPx()))
         drawCircle(primary, radius = 5.dp.toPx(), center = Offset(centerX, height - 8.dp.toPx()))
-        drawRoundRect(
-            color = primary.copy(alpha = 0.14f),
-            topLeft = Offset(centerX - 14.dp.toPx(), height - 20.dp.toPx()),
-            size = Size(28.dp.toPx(), 12.dp.toPx()),
-            cornerRadius = CornerRadius(6.dp.toPx()),
-        )
     }
 }
 
