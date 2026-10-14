@@ -516,6 +516,20 @@ private fun editorColors() = darkColorScheme(
     surfaceVariant = Color(0xFF202B35),
 )
 
+private const val MAX_UNDO_STEPS = 20
+
+/** 只记录分段编辑上下文，播放进度和选中变化本身不生成历史记录。 */
+private data class SegmentEditSnapshot(
+    val segments: List<AudioEditorActivity.AudioSegment>,
+    val selectedSegmentIndex: Int,
+    val playHeadFraction: Float,
+)
+
+private data class SegmentEdit(
+    val before: SegmentEditSnapshot,
+    val after: SegmentEditSnapshot,
+)
+
 @OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
 private fun AudioEditorScreen(
@@ -543,6 +557,12 @@ private fun AudioEditorScreen(
         )
     }
     var selectedSegmentIndex by remember(firstTrack?.file) { mutableIntStateOf(0) }
+    var undoHistory by remember(firstTrack?.file) {
+        mutableStateOf<List<SegmentEdit>>(emptyList())
+    }
+    var redoHistory by remember(firstTrack?.file) {
+        mutableStateOf<List<SegmentEdit>>(emptyList())
+    }
     var speed by remember { mutableFloatStateOf(1f) }
     var pitch by remember { mutableFloatStateOf(0f) }
     val durationMs = firstTrack?.durationMs ?: 1L
@@ -582,6 +602,35 @@ private fun AudioEditorScreen(
         }
     }
 
+    fun recordSegmentEdit(
+        updatedSegments: List<AudioEditorActivity.AudioSegment>,
+        updatedSelectedIndex: Int,
+    ) {
+        if (updatedSegments == segments) return
+        val before = SegmentEditSnapshot(
+            segments = segments.toList(),
+            selectedSegmentIndex = selectedSegmentIndex,
+            playHeadFraction = playHeadFraction,
+        )
+        val after = before.copy(
+            segments = updatedSegments.toList(),
+            selectedSegmentIndex = updatedSelectedIndex,
+        )
+        undoHistory = (undoHistory + SegmentEdit(before, after)).takeLast(MAX_UNDO_STEPS)
+        redoHistory = emptyList()
+        segments = after.segments
+        selectedSegmentIndex = after.selectedSegmentIndex
+    }
+
+    fun restoreSegmentEdit(snapshot: SegmentEditSnapshot) {
+        // 暂停旧分段的播放，下次播放会使用恢复后的分段列表和播放头。
+        onPausePlayback()
+        segments = snapshot.segments
+        selectedSegmentIndex = snapshot.selectedSegmentIndex
+        playHeadFraction = snapshot.playHeadFraction
+        onSeekPlayback((durationMs * snapshot.playHeadFraction).roundToInt().toLong())
+    }
+
     val splitSegment = {
         onPausePlayback()
         val splitAtMs = playHeadMs.coerceIn(0L, durationMs)
@@ -591,7 +640,7 @@ private fun AudioEditorScreen(
         } ?: -1
         if (segmentIndex >= 0) {
             val source = segments[segmentIndex]
-            segments = segments.toMutableList().apply {
+            val updatedSegments = segments.toMutableList().apply {
                 removeAt(segmentIndex)
                 add(
                     segmentIndex,
@@ -608,7 +657,7 @@ private fun AudioEditorScreen(
                     )
                 )
             }
-            selectedSegmentIndex = segmentIndex + 1
+            recordSegmentEdit(updatedSegments, segmentIndex + 1)
         }
         Log.d("AudioEditorScreen", "segments size: ${segments.size}")
     }
@@ -725,16 +774,42 @@ private fun AudioEditorScreen(
                             OutlinedButton(
                                 onClick = {
                                     onPausePlayback()
-                                    if (selectedSegmentIndex in segments.indices) {
-                                        segments = segments.toMutableList()
+                                    if (segments.size > 1 && selectedSegmentIndex in segments.indices) {
+                                        val updatedSegments = segments.toMutableList()
                                             .apply { removeAt(selectedSegmentIndex) }
-                                        selectedSegmentIndex =
-                                            (selectedSegmentIndex - 1).coerceAtLeast(0)
+                                        recordSegmentEdit(
+                                            updatedSegments,
+                                            (selectedSegmentIndex - 1).coerceAtLeast(0),
+                                        )
                                     }
                                 },
                                 enabled = selectedSegment != null && canDeleteSegment,
                                 modifier = Modifier.weight(1f),
                             ) { Text("删除选中分段") }
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            OutlinedButton(
+                                onClick = {
+                                    undoHistory.lastOrNull()?.let { edit ->
+                                        restoreSegmentEdit(edit.before)
+                                        undoHistory = undoHistory.dropLast(1)
+                                        redoHistory = redoHistory + edit
+                                    }
+                                },
+                                enabled = !busy && undoHistory.isNotEmpty(),
+                                modifier = Modifier.weight(1f),
+                            ) { Text("撤销") }
+                            OutlinedButton(
+                                onClick = {
+                                    redoHistory.lastOrNull()?.let { edit ->
+                                        restoreSegmentEdit(edit.after)
+                                        redoHistory = redoHistory.dropLast(1)
+                                        undoHistory = (undoHistory + edit).takeLast(MAX_UNDO_STEPS)
+                                    }
+                                },
+                                enabled = !busy && redoHistory.isNotEmpty(),
+                                modifier = Modifier.weight(1f),
+                            ) { Text("重做") }
                         }
                     }
                 }
@@ -813,16 +888,21 @@ private fun AudioEditorScreen(
                                         enabled = canDeleteSegment,
                                         onClick = {
                                             onPausePlayback()
-                                            segments =
-                                                segments.toMutableList().apply { removeAt(index) }
-                                            selectedSegmentIndex = when {
-                                                segments.isEmpty() -> 0
-                                                index < selectedSegmentIndex -> selectedSegmentIndex - 1
-                                                index == selectedSegmentIndex -> index.coerceAtMost(
-                                                    segments.lastIndex
-                                                )
+                                            if (segments.size > 1 && index in segments.indices) {
+                                                val updatedSegments = segments.toMutableList()
+                                                    .apply { removeAt(index) }
+                                                val updatedSelectedIndex = when {
+                                                    index < selectedSegmentIndex -> selectedSegmentIndex - 1
+                                                    index == selectedSegmentIndex -> index.coerceAtMost(
+                                                        updatedSegments.lastIndex
+                                                    )
 
-                                                else -> selectedSegmentIndex
+                                                    else -> selectedSegmentIndex
+                                                }
+                                                recordSegmentEdit(
+                                                    updatedSegments,
+                                                    updatedSelectedIndex,
+                                                )
                                             }
                                         },
                                     ) { Text("删除") }
